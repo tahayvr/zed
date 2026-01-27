@@ -11,7 +11,18 @@ GPUI is still in active development as we work on the Zed code editor, and is st
 gpui = { version = "*" }
 ```
 
- - [Ownership and data flow](_ownership_and_data_flow)
+### 📚 Documentation
+
+- **[Quick Start Guide](docs/quick_start.md)** - Get your first app running in 5 minutes
+- **[Beginner's Guide](docs/beginner_guide.md)** - Complete tutorial for learning GPUI
+- **[Examples Reference](docs/examples_reference.md)** - Guide to all GPUI examples
+- **[Documentation Index](docs/README.md)** - Complete documentation overview
+
+### Core Concepts
+
+- [Ownership and data flow](_ownership_and_data_flow)
+- [Contexts](docs/contexts.md) - Understanding context types
+- [Key Dispatch](docs/key_dispatch.md) - Keyboard actions and shortcuts
 
 Everything in GPUI starts with an `Application`. You can create one with `Application::new()`, and kick off your application by passing a callback to `Application::run()`. Inside this callback, you can create a new window with `App::open_window()`, and register your first root view. See [gpui.rs](https://www.gpui.rs/) for a complete example.
 
@@ -63,4 +74,10 @@ In addition to the systems above, GPUI provides a range of smaller services that
 
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
-Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
+## Learning Resources
+
+- **[Beginner's Guide](docs/beginner_guide.md)** - Comprehensive tutorial covering all aspects of GPUI
+- **[Examples](examples/)** - Browse example applications demonstrating GPUI features
+- **[Zed Source Code](../../)** - Study real-world GPUI usage in the Zed editor
+- **[Zed Discord](https://zed.dev/community-links)** - Get help from the community
+- **[Zed Blog](https://zed.dev/blog)** - Deep dives and updates about GPUI
