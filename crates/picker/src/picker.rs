@@ -76,6 +76,7 @@ pub struct Picker<D: PickerDelegate> {
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    mouse_interaction: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -342,6 +343,7 @@ impl<D: PickerDelegate> Picker<D> {
             is_modal: true,
             picker_bounds: Rc::new(Cell::new(None)),
             item_bounds: Rc::new(RefCell::new(HashMap::default())),
+            mouse_interaction: false,
         };
         this.update_matches("".to_string(), window, cx);
         // give the delegate 4ms to render the first set of suggestions.
@@ -473,6 +475,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_interaction = false;
         let query = self.query(cx);
         if let Some(query) = self
             .delegate
@@ -500,6 +503,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_interaction = false;
         let query = self.query(cx);
         if let Some(query) = self
             .delegate
@@ -527,6 +531,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_interaction = false;
         let count = self.delegate.match_count();
         if count > 0 {
             self.set_selected_index(0, Some(Direction::Down), true, window, cx);
@@ -535,6 +540,7 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.mouse_interaction = false;
         let count = self.delegate.match_count();
         if count > 0 {
             self.set_selected_index(count - 1, Some(Direction::Up), true, window, cx);
@@ -543,6 +549,7 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     pub fn cycle_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mouse_interaction = false;
         let count = self.delegate.match_count();
         let index = self.delegate.selected_index();
         let new_index = if index + 1 == count { 0 } else { index + 1 };
@@ -757,6 +764,12 @@ impl<D: PickerDelegate> Picker<D> {
         div()
             .id(("item", ix))
             .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.mouse_interaction = true;
+                    this.set_selected_index(ix, None, true, window, cx);
+                }
+            }))
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
