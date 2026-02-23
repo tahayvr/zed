@@ -76,7 +76,10 @@ pub struct Picker<D: PickerDelegate> {
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// currently interacting with mouse.
     mouse_interaction: bool,
+    /// index for keyboard navigation only.
+    keyboard_selected_index: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -344,6 +347,7 @@ impl<D: PickerDelegate> Picker<D> {
             picker_bounds: Rc::new(Cell::new(None)),
             item_bounds: Rc::new(RefCell::new(HashMap::default())),
             mouse_interaction: false,
+            keyboard_selected_index: 0,
         };
         this.update_matches("".to_string(), window, cx);
         // give the delegate 4ms to render the first set of suggestions.
@@ -488,6 +492,7 @@ impl<D: PickerDelegate> Picker<D> {
         if count > 0 {
             let index = self.delegate.selected_index();
             let ix = if index == count - 1 { 0 } else { index + 1 };
+            self.keyboard_selected_index = ix;
             self.set_selected_index(ix, Some(Direction::Down), true, window, cx);
             cx.notify();
         }
@@ -516,6 +521,7 @@ impl<D: PickerDelegate> Picker<D> {
         if count > 0 {
             let index = self.delegate.selected_index();
             let ix = if index == 0 { count - 1 } else { index - 1 };
+            self.keyboard_selected_index = ix;
             self.set_selected_index(ix, Some(Direction::Up), true, window, cx);
             cx.notify();
         }
@@ -534,6 +540,7 @@ impl<D: PickerDelegate> Picker<D> {
         self.mouse_interaction = false;
         let count = self.delegate.match_count();
         if count > 0 {
+            self.keyboard_selected_index = 0;
             self.set_selected_index(0, Some(Direction::Down), true, window, cx);
             cx.notify();
         }
@@ -543,7 +550,9 @@ impl<D: PickerDelegate> Picker<D> {
         self.mouse_interaction = false;
         let count = self.delegate.match_count();
         if count > 0 {
-            self.set_selected_index(count - 1, Some(Direction::Up), true, window, cx);
+            let ix = count - 1;
+            self.keyboard_selected_index = ix;
+            self.set_selected_index(ix, Some(Direction::Up), true, window, cx);
             cx.notify();
         }
     }
@@ -553,6 +562,7 @@ impl<D: PickerDelegate> Picker<D> {
         let count = self.delegate.match_count();
         let index = self.delegate.selected_index();
         let new_index = if index + 1 == count { 0 } else { index + 1 };
+        self.keyboard_selected_index = new_index;
         self.set_selected_index(new_index, Some(Direction::Down), true, window, cx);
         cx.notify();
     }
@@ -626,6 +636,8 @@ impl<D: PickerDelegate> Picker<D> {
     ) {
         cx.stop_propagation();
         window.prevent_default();
+        self.mouse_interaction = true;
+        self.keyboard_selected_index = ix;
         self.set_selected_index(ix, None, false, window, cx);
         self.do_confirm(secondary, window, cx)
     }
@@ -633,6 +645,7 @@ impl<D: PickerDelegate> Picker<D> {
     fn do_confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(update_query) = self.delegate.confirm_update_query(window, cx) {
             self.set_query(&update_query, window, cx);
+            self.keyboard_selected_index = 0;
             self.set_selected_index(0, Some(Direction::Down), false, window, cx);
         } else {
             self.delegate.confirm(secondary, window, cx)
@@ -722,6 +735,7 @@ impl<D: PickerDelegate> Picker<D> {
         }
 
         let index = self.delegate.selected_index();
+        self.keyboard_selected_index = index;
         self.scroll_to_item_index(index);
         self.pending_update_matches = None;
         if let Some(secondary) = self.confirm_on_update.take() {
@@ -799,7 +813,7 @@ impl<D: PickerDelegate> Picker<D> {
             )
             .children(self.delegate.render_match(
                 ix,
-                ix == self.delegate.selected_index(),
+                !self.mouse_interaction && ix == self.keyboard_selected_index,
                 window,
                 cx,
             ))
