@@ -309,6 +309,10 @@ impl Status {
         )
     }
 
+    pub fn is_signed_in(&self) -> bool {
+        matches!(self, Self::Authenticated | Self::Reauthenticated)
+    }
+
     pub fn is_signed_out(&self) -> bool {
         matches!(self, Self::SignedOut | Self::UpgradeRequired)
     }
