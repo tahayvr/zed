@@ -3,11 +3,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use collections::HashSet;
+use futures::FutureExt;
 use gpui::{
     App, Context, FontStyle, FontWeight, HighlightStyle, ImageSource, IntoElement, ParentElement,
-    Styled, StyledImage, Task, Window, div, px,
+    Styled, StyledImage, StyledText, Task, Window, div, px,
 };
-use language::{BufferSnapshot, LanguageName, Node, TreeCursor};
+use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
 use theme::ActiveTheme;
@@ -63,6 +64,8 @@ pub struct MarkdownDecoratorNode {
     pub background_range: Option<Range<Anchor>>,
     /// For image nodes: the resolved URL text extracted from the link destination.
     pub image_url: Option<String>,
+    /// For fenced code blocks: the language name from the info string, if present.
+    pub code_language: Option<String>,
     /// Rendered preview text for block-level markdown nodes.
     pub preview_text: Option<String>,
 }
@@ -383,11 +386,29 @@ fn apply_blocks(
                     continue;
                 };
                 let height = preview_text_height(&text, 2);
+                let language = node.code_language.as_deref().and_then(|language_name| {
+                    let registry = editor
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .and_then(|buffer| buffer.read(cx).language_registry())?;
+                    registry
+                        .language_for_name(language_name)
+                        .now_or_never()
+                        .and_then(Result::ok)
+                });
+                let language = language.or_else(|| {
+                    editor
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .and_then(|buffer| buffer.read(cx).language().cloned())
+                });
                 new_blocks.push(BlockProperties {
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: render_code_block(text),
+                    render: render_code_block(text, language),
                     priority: 0,
                 });
             }
@@ -470,10 +491,11 @@ fn render_image_block(resolved_url: String) -> RenderBlock {
     })
 }
 
-fn render_code_block(text: String) -> RenderBlock {
+fn render_code_block(text: String, language: Option<Arc<Language>>) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
+        let text_style = cx.editor_style.text.clone();
         div()
             .ml(cx.anchor_x)
             .max_w(cx.max_width)
@@ -488,9 +510,47 @@ fn render_code_block(text: String) -> RenderBlock {
             .font(cx.editor_style.text.font())
             .text_color(colors.text)
             .line_height(cx.line_height)
-            .children(text_lines(text.as_ref()))
+            .children(code_lines(text.as_ref(), language.as_ref(), &text_style, cx.app))
             .into_any_element()
     })
+}
+
+fn code_lines(
+    text: &str,
+    language: Option<&Arc<Language>>,
+    text_style: &gpui::TextStyle,
+    cx: &App,
+) -> Vec<gpui::AnyElement> {
+    text.lines()
+        .map(|line| {
+            let highlights = language
+                .map(|language| syntax_highlights_for_line(line, language, cx))
+                .unwrap_or_default();
+            div()
+                .h_5()
+                .child(StyledText::new(line.to_string()).with_default_highlights(text_style, highlights))
+                .into_any_element()
+        })
+        .collect()
+}
+
+fn syntax_highlights_for_line(
+    line: &str,
+    language: &Arc<Language>,
+    cx: &App,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let rope = rope::Rope::from(line);
+    language
+        .highlight_text(&rope, 0..line.len())
+        .into_iter()
+        .filter_map(|(range, highlight_id)| {
+            cx.theme()
+                .syntax()
+                .get(highlight_id)
+                .cloned()
+                .map(|style| (range, style))
+        })
+        .collect()
 }
 
 fn render_heading_block(text: String, level: u8) -> RenderBlock {
@@ -872,6 +932,7 @@ fn parse_atx_heading(
         kind: MarkdownNodeKind::Heading(level),
         background_range: None,
         image_url: None,
+        code_language: None,
         preview_text: Some(preview_text.trim().to_string()),
     })
 }
@@ -889,6 +950,7 @@ fn parse_task_list_marker(
         kind: MarkdownNodeKind::Checkbox { checked },
         background_range: None,
         image_url: None,
+        code_language: None,
         preview_text: None,
     })
 }
@@ -900,15 +962,29 @@ fn parse_fenced_code_block(
 ) -> Option<MarkdownDecoratorNode> {
     let mut content_start: Option<usize> = None;
     let mut content_end: Option<usize> = None;
+    let mut code_language: Option<String> = None;
 
     let mut child_cursor = node.walk();
     if child_cursor.goto_first_child() {
         loop {
             let child = child_cursor.node();
-            if child.kind() == "code_fence_content" {
-                content_start = Some(child.start_byte());
-                content_end = Some(child.end_byte());
-                break;
+            match child.kind() {
+                "info_string" => {
+                    let language = snapshot
+                        .chars_for_range(child.byte_range())
+                        .collect::<String>()
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_string);
+                    code_language = language;
+                }
+                "code_fence_content" => {
+                    content_start = Some(child.start_byte());
+                    content_end = Some(child.end_byte());
+                    break;
+                }
+                _ => {}
             }
             if !child_cursor.goto_next_sibling() {
                 break;
@@ -961,6 +1037,7 @@ fn parse_fenced_code_block(
         kind: MarkdownNodeKind::FencedCode,
         background_range,
         image_url: None,
+        code_language,
         preview_text,
     })
 }
@@ -1023,6 +1100,7 @@ fn parse_blockquote(
         kind: MarkdownNodeKind::Blockquote,
         background_range,
         image_url: None,
+        code_language: None,
         preview_text: Some(preview_text),
     })
 }
@@ -1091,6 +1169,7 @@ fn parse_emphasis_node(
         kind,
         background_range: None,
         image_url: None,
+        code_language: None,
         preview_text: None,
     })
 }
@@ -1128,6 +1207,7 @@ fn parse_code_span(
         kind: MarkdownNodeKind::InlineCode,
         background_range: None,
         image_url: None,
+        code_language: None,
         preview_text: None,
     })
 }
@@ -1171,6 +1251,7 @@ fn parse_inline_link(
         kind: MarkdownNodeKind::Link,
         background_range: None,
         image_url: None,
+        code_language: None,
         preview_text: None,
     })
 }
@@ -1239,6 +1320,7 @@ fn parse_image(
         kind: MarkdownNodeKind::Image,
         background_range: None,
         image_url,
+        code_language: None,
         preview_text: None,
     })
 }
