@@ -6,8 +6,9 @@ use collections::HashSet;
 use futures::FutureExt;
 use gpui::{
     App, Context, FontStyle, FontWeight, HighlightStyle, ImageSource, IntoElement, ParentElement,
-    Styled, StyledImage, StyledText, Task, Window, div, px,
+    Styled, StyledImage, StyledText, Task, WeakEntity, Window, div, px,
 };
+use gpui::prelude::InteractiveElement as _;
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
@@ -20,8 +21,11 @@ use crate::display_map::{
 use crate::editor_settings::EditorSettings;
 use crate::Editor;
 
-/// How many editor lines the image preview occupies when replacing image syntax.
-const IMAGE_BLOCK_HEIGHT_LINES: u32 = 28;
+/// Fallback editor-line height for image previews when dimensions are unavailable.
+const IMAGE_BLOCK_FALLBACK_HEIGHT_LINES: u32 = 18;
+const IMAGE_BLOCK_MIN_HEIGHT_LINES: u32 = 6;
+const IMAGE_BLOCK_MAX_HEIGHT_LINES: u32 = 32;
+const IMAGE_BLOCK_MAX_WIDTH_PX: f32 = 900.0;
 
 /// Type tag used to identify folds created by the markdown live preview feature.
 /// This allows selective removal without disturbing other fold types.
@@ -343,6 +347,7 @@ fn apply_blocks(
         .and_then(|p| p.parent().map(|dir| Arc::from(dir)));
 
     let mut new_blocks: Vec<BlockProperties<Anchor>> = Vec::new();
+    let weak_editor = cx.weak_entity();
 
     for node in nodes {
         let node_start = node.full_range.start.to_offset(multi_snapshot).0;
@@ -363,7 +368,7 @@ fn apply_blocks(
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(heading_block_height(level)),
                     style: BlockStyle::Flex,
-                    render: render_heading_block(text, level),
+                    render: render_heading_block(text, level, node.full_range.start, weak_editor.clone()),
                     priority: 0,
                 });
             }
@@ -372,10 +377,11 @@ fn apply_blocks(
                     continue;
                 };
                 let resolved_url = resolve_image_url(url_text, base_dir.as_deref());
-                let render = render_image_block(resolved_url);
+                let image_height = image_block_height_lines(&resolved_url);
+                let render = render_image_block(resolved_url, node.full_range.start, weak_editor.clone());
                 new_blocks.push(BlockProperties {
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
-                    height: Some(IMAGE_BLOCK_HEIGHT_LINES),
+                    height: Some(image_height),
                     style: BlockStyle::Flex,
                     render,
                     priority: 0,
@@ -408,7 +414,7 @@ fn apply_blocks(
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: render_code_block(text, language),
+                    render: render_code_block(text, language, node.full_range.start, weak_editor.clone()),
                     priority: 0,
                 });
             }
@@ -421,7 +427,7 @@ fn apply_blocks(
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: render_blockquote_block(text),
+                    render: render_blockquote_block(text, node.full_range.start, weak_editor.clone()),
                     priority: 0,
                 });
             }
@@ -448,6 +454,25 @@ fn heading_block_height(level: u8) -> u32 {
     }
 }
 
+fn image_block_height_lines(resolved_url: &str) -> u32 {
+    if resolved_url.contains("://") {
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+    }
+
+    let Ok((width, height)) = image::image_dimensions(resolved_url) else {
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+    };
+    if width == 0 || height == 0 {
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+    }
+
+    let rendered_width = (width as f32).min(IMAGE_BLOCK_MAX_WIDTH_PX);
+    let rendered_height = rendered_width * height as f32 / width as f32;
+    let estimated_line_height = 20.0;
+    ((rendered_height / estimated_line_height).ceil() as u32 + 1)
+        .clamp(IMAGE_BLOCK_MIN_HEIGHT_LINES, IMAGE_BLOCK_MAX_HEIGHT_LINES)
+}
+
 /// Resolves an image URL to an absolute string suitable for display.
 /// Returns an absolute URI (http/https) or an absolute file path string.
 fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
@@ -462,7 +487,11 @@ fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
 
 /// Constructs the render closure for an image block decoration.
 /// Captures only a `String` (Send + Sync) to avoid ImageSource::Custom's non-Send dyn Fn.
-fn render_image_block(resolved_url: String) -> RenderBlock {
+fn render_image_block(
+    resolved_url: String,
+    source_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
     let resolved_url: Arc<str> = resolved_url.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         if resolved_url.is_empty() {
@@ -474,29 +503,31 @@ fn render_image_block(resolved_url: String) -> RenderBlock {
         } else {
             ImageSource::from(std::path::PathBuf::from(resolved_url.as_ref()))
         };
-        let max_width = cx.max_width.min(px(900.));
-        div()
+        let max_width = cx.max_width.min(px(IMAGE_BLOCK_MAX_WIDTH_PX));
+        let mut container = div()
             .ml(cx.anchor_x)
             .w_full()
             .max_w(max_width)
             .h_full()
-            .py_0p5()
-            .child(
-                gpui::img(source)
-                    .object_fit(gpui::ObjectFit::Contain)
-                    .w_full()
-                    .h_full(),
-            )
+            .py_0p5();
+        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+        container
+            .child(gpui::img(source).object_fit(gpui::ObjectFit::Contain).w_full().h_full())
             .into_any_element()
     })
 }
 
-fn render_code_block(text: String, language: Option<Arc<Language>>) -> RenderBlock {
+fn render_code_block(
+    text: String,
+    language: Option<Arc<Language>>,
+    source_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let text_style = cx.editor_style.text.clone();
-        div()
+        let mut container = div()
             .ml(cx.anchor_x)
             .max_w(cx.max_width)
             .w_full()
@@ -509,7 +540,9 @@ fn render_code_block(text: String, language: Option<Arc<Language>>) -> RenderBlo
             .border_color(colors.border_variant)
             .font(cx.editor_style.text.font())
             .text_color(colors.text)
-            .line_height(cx.line_height)
+            .line_height(cx.line_height);
+        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+        container
             .children(code_lines(text.as_ref(), language.as_ref(), &text_style, cx.app))
             .into_any_element()
     })
@@ -553,11 +586,16 @@ fn syntax_highlights_for_line(
         .collect()
 }
 
-fn render_heading_block(text: String, level: u8) -> RenderBlock {
+fn render_heading_block(
+    text: String,
+    level: u8,
+    source_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
-        let element = div()
+        let mut element = div()
             .ml(cx.anchor_x)
             .max_w(cx.max_width)
             .w_full()
@@ -567,6 +605,7 @@ fn render_heading_block(text: String, level: u8) -> RenderBlock {
             .font_weight(FontWeight::BOLD)
             .line_height(cx.line_height)
             .child(text.as_ref().to_string());
+        attach_source_click_handler(&mut element, source_anchor, weak_editor.clone());
 
         match level {
             1 => element.text_3xl(),
@@ -580,11 +619,15 @@ fn render_heading_block(text: String, level: u8) -> RenderBlock {
     })
 }
 
-fn render_blockquote_block(text: String) -> RenderBlock {
+fn render_blockquote_block(
+    text: String,
+    source_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
-        div()
+        let mut container = div()
             .ml(cx.anchor_x)
             .max_w(cx.max_width)
             .w_full()
@@ -594,10 +637,26 @@ fn render_blockquote_block(text: String) -> RenderBlock {
             .border_color(colors.border)
             .font(cx.editor_style.text.font())
             .text_color(colors.text_muted)
-            .line_height(cx.line_height)
+            .line_height(cx.line_height);
+        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+        container
             .children(text_lines(text.as_ref()))
             .into_any_element()
     })
+}
+
+fn attach_source_click_handler(
+    element: &mut gpui::Div,
+    source_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) {
+    element.interactivity().on_click(move |_, window, cx| {
+        let _ = weak_editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([source_anchor..source_anchor]);
+            });
+        });
+    });
 }
 
 fn text_lines(text: &str) -> Vec<gpui::AnyElement> {
@@ -1373,5 +1432,21 @@ mod tests {
         let base = std::path::Path::new("/tmp/notes");
         let url = resolve_image_url("images/photo.png", Some(base));
         assert!(url.contains("images/photo.png"));
+    }
+
+    #[test]
+    fn test_image_block_height_uses_fallback_for_remote_images() {
+        assert_eq!(
+            image_block_height_lines("https://example.com/image.png"),
+            IMAGE_BLOCK_FALLBACK_HEIGHT_LINES
+        );
+    }
+
+    #[test]
+    fn test_image_block_height_uses_fallback_for_missing_local_images() {
+        assert_eq!(
+            image_block_height_lines("/tmp/definitely-missing-image.png"),
+            IMAGE_BLOCK_FALLBACK_HEIGHT_LINES
+        );
     }
 }
