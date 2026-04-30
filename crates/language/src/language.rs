@@ -1635,6 +1635,34 @@ pub fn markdown_lang() -> Arc<Language> {
     Arc::new(language)
 }
 
+/// Creates a minimal `markdown-inline` language for use in tests.
+/// This language handles inline markdown syntax (bold, italic, code spans, links)
+/// and is injected into block markdown documents via the markdown injection queries.
+#[cfg(any(test, feature = "test-support"))]
+pub fn markdown_inline_lang() -> Arc<Language> {
+    use std::borrow::Cow;
+
+    let language = Language::new(
+        LanguageConfig {
+            name: "Markdown-Inline".into(),
+            hidden: true,
+            ..LanguageConfig::default()
+        },
+        Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+    )
+    .with_queries(LanguageQueries {
+        highlights: Some(Cow::from(include_str!(
+            "../../grammars/src/markdown-inline/highlights.scm"
+        ))),
+        injections: Some(Cow::from(include_str!(
+            "../../grammars/src/markdown-inline/injections.scm"
+        ))),
+        ..LanguageQueries::default()
+    })
+    .expect("Could not parse markdown-inline queries");
+    Arc::new(language)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2825,6 +2825,31 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
+    fn markdown_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Markdown"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Live Preview",
+                description: "Hide syntax markers when the cursor is not on them and render rich text styling (bold, italic, heading colors) inline in the editor.",
+                field: Box::new(SettingField {
+                    json_path: Some("editor.markdown.live_preview"),
+                    pick: |settings_content| {
+                        settings_content.editor.markdown.as_ref()?.live_preview.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .markdown
+                            .get_or_insert_default()
+                            .live_preview = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     let items = concat_sections!(
         auto_save_section(),
         which_key_section(),
@@ -2838,6 +2863,7 @@ fn editor_page() -> SettingsPage {
         minimap_section(),
         toolbar_section(),
         vim_settings_section(),
+        markdown_section(),
         language_settings_data(),
     );
 

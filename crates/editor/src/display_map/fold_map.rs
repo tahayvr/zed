@@ -36,6 +36,8 @@ pub struct FoldPlaceholder {
     /// Text provided by the language server to display in place of the folded range.
     /// When set, this is used instead of the default "⋯" ellipsis.
     pub collapsed_text: Option<SharedString>,
+    /// If true, the gutter fold indicator (chevron) is not shown for lines folded by this placeholder.
+    pub hide_fold_indicator: bool,
 }
 
 impl Default for FoldPlaceholder {
@@ -46,6 +48,7 @@ impl Default for FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            hide_fold_indicator: false,
         }
     }
 }
@@ -79,6 +82,7 @@ impl FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            hide_fold_indicator: false,
         }
     }
 }

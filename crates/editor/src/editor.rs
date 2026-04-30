@@ -33,6 +33,7 @@ pub mod items;
 mod jsx_tag_auto_close;
 mod linked_editing_ranges;
 mod lsp_ext;
+mod markdown_live_preview;
 mod mouse_context_menu;
 pub mod movement;
 mod persistence;
@@ -1388,6 +1389,7 @@ pub struct Editor {
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
+    pub markdown_live_preview: Option<markdown_live_preview::MarkdownLivePreview>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2684,6 +2686,7 @@ impl Editor {
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
+            markdown_live_preview: None,
         };
 
         if is_minimap {
@@ -3869,6 +3872,10 @@ impl Editor {
 
         cx.emit(EditorEvent::SelectionsChanged { local });
 
+        if self.markdown_live_preview.is_some() {
+            markdown_live_preview::update_folds(self, window, cx);
+        }
+
         let selections = &self.selections.disjoint_anchors_arc();
         if local && let Some(buffer_snapshot) = buffer.as_singleton() {
             let inmemory_selections = selections
@@ -3938,6 +3945,12 @@ impl Editor {
         };
         let inmemory_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| {
+                // Exclude ephemeral markdown live preview folds — they must not be persisted
+                // because they are rebuilt on every cursor movement.
+                fold.placeholder.type_tag
+                    != Some(crate::markdown_live_preview::fold_type_id())
+            })
             .map(|fold| {
                 let start = fold.range.start.text_anchor_in(buffer_snapshot);
                 let end = fold.range.end.text_anchor_in(buffer_snapshot);
@@ -3962,8 +3975,13 @@ impl Editor {
 
         let background_executor = cx.background_executor().clone();
         const FINGERPRINT_LEN: usize = 32;
+        let markdown_fold_type = crate::markdown_live_preview::fold_type_id();
         let db_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| {
+                // Never persist ephemeral markdown live preview folds.
+                fold.placeholder.type_tag != Some(markdown_fold_type)
+            })
             .map(|fold| {
                 let start = fold
                     .range
@@ -8043,6 +8061,7 @@ impl Editor {
                 merge_adjacent: false,
                 type_tag: Some(type_id),
                 collapsed_text: None,
+                hide_fold_indicator: false,
             };
             let creases = new_newlines
                 .into_iter()
@@ -25191,6 +25210,17 @@ impl Editor {
                 self.colorize_brackets(true, cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
 
+                if markdown_live_preview::should_activate(self, cx) {
+                    if self.markdown_live_preview.is_none() {
+                        self.markdown_live_preview =
+                            Some(markdown_live_preview::MarkdownLivePreview::new());
+                    }
+                    markdown_live_preview::refresh(self, window, cx);
+                } else if self.markdown_live_preview.is_some() {
+                    markdown_live_preview::remove_all(self, cx);
+                    self.markdown_live_preview = None;
+                }
+
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
             multi_buffer::Event::DiffHunksToggled => {
@@ -25203,6 +25233,13 @@ impl Editor {
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
+                // If the language is no longer Markdown (or settings changed), tear down.
+                if !markdown_live_preview::should_activate(self, cx)
+                    && self.markdown_live_preview.is_some()
+                {
+                    markdown_live_preview::remove_all(self, cx);
+                    self.markdown_live_preview = None;
+                }
                 cx.notify();
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
@@ -28911,6 +28948,42 @@ impl EditorSnapshot {
         let folded = self.is_line_folded(buffer_row);
         let mut is_foldable = false;
 
+        let markdown_live_preview_block_ids = {
+            let editor = editor.read(cx);
+            if editor.markdown_live_preview.is_some() {
+                crate::markdown_live_preview::block_ids(editor)
+            } else {
+                Default::default()
+            }
+        };
+        if !markdown_live_preview_block_ids.is_empty() {
+            let buffer_snapshot = self.display_snapshot.buffer_snapshot();
+            let row_start = MultiBufferPoint::new(buffer_row.0, 0);
+            let row_end = MultiBufferPoint::new(buffer_row.0, buffer_snapshot.line_len(buffer_row));
+            let start_display_row = self
+                .display_snapshot
+                .point_to_display_point(row_start, Bias::Left)
+                .row();
+            let end_display_row = self
+                .display_snapshot
+                .point_to_display_point(row_end, Bias::Right)
+                .row()
+                + 1;
+            let contains_markdown_live_preview_block = self
+                .display_snapshot
+                .blocks_in_range(start_display_row..end_display_row)
+                .any(|(_, block)| {
+                    if let Block::Custom(block) = block {
+                        markdown_live_preview_block_ids.contains(&block.id)
+                    } else {
+                        false
+                    }
+                });
+            if contains_markdown_live_preview_block {
+                return None;
+            }
+        }
+
         if let Some(crease) = self
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())
@@ -28946,6 +29019,19 @@ impl EditorSnapshot {
         is_foldable |= !self.use_lsp_folding_ranges && self.starts_indent(buffer_row);
 
         if folded || (is_foldable && (row_contains_cursor || self.gutter_hovered)) {
+            let buffer_snapshot = self.display_snapshot.buffer_snapshot();
+            let row_start = MultiBufferPoint::new(buffer_row.0, 0);
+            let row_end = MultiBufferPoint::new(
+                buffer_row.0,
+                buffer_snapshot.line_len(buffer_row),
+            );
+            let hide_indicator = self
+                .display_snapshot
+                .folds_in_range(row_start..row_end)
+                .any(|fold| fold.placeholder.hide_fold_indicator);
+            if hide_indicator {
+                return None;
+            }
             Some(
                 Disclosure::new(("gutter_crease", buffer_row.0), !folded)
                     .toggle_state(folded)

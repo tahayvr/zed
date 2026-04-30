@@ -33,6 +33,7 @@ use language::{
     tree_sitter_python,
 };
 use language_settings::Formatter;
+use languages::markdown_inline_lang;
 use languages::markdown_lang;
 use languages::rust_lang;
 use lsp::{CompletionParams, DEFAULT_LSP_REQUEST_TIMEOUT};
@@ -37366,4 +37367,300 @@ fn setup_syntax_highlighting_with_theme(
             cx,
         );
     });
+}
+
+// ── Markdown Live Preview integration tests ──────────────────────────────────
+
+#[gpui::test]
+async fn test_markdown_live_preview_disabled_by_default(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        ## A headingˇ
+
+        **bold text**
+    "});
+    cx.run_until_parked();
+
+    // With live_preview disabled (default), no folds should be applied.
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len())
+            .count()
+    });
+    assert_eq!(fold_count, 0, "expected no folds when live_preview is disabled");
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_folds_heading_marker_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    // Place cursor on line 3 (far away from the heading on line 1).
+    cx.set_state(indoc! {"
+        ## A heading
+
+        Some other textˇ
+    "});
+    cx.run_until_parked();
+
+    // The heading should be replaced with a preview block.
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected at least one preview block for the heading, got {block_count}"
+    );
+
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len())
+            .count()
+    });
+    assert_eq!(
+        fold_count, 0,
+        "expected heading preview block without marker folds"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_unfolds_heading_when_cursor_enters(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    // Start with cursor away from heading so preview blocks are applied.
+    cx.set_state(indoc! {"
+        ## A heading
+
+        Some other textˇ
+    "});
+    cx.run_until_parked();
+
+    let block_count_before = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count_before >= 1,
+        "precondition: expected preview block before cursor enters heading"
+    );
+
+    // Move cursor onto the heading line without replacing buffer content,
+    // so existing fold anchors remain valid.
+    cx.set_selections_state(indoc! {"
+        ## A headingˇ
+
+        Some other text
+    "});
+    cx.run_until_parked();
+
+    // The replacement block should be removed when the cursor enters the heading.
+    let block_count_after = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert_eq!(
+        block_count_after, 0,
+        "expected no preview block when cursor is inside the heading node"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_folds_bold_markers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+    // markdown-inline is injected by markdown for inline spans (bold, italic, etc.)
+    language_registry.add(markdown_inline_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    // Cursor is on a different line from the bold span.
+    cx.set_state(indoc! {"
+        **bold text**
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    // Expect both `**` delimiter folds.
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len())
+            .count()
+    });
+    assert!(
+        fold_count >= 2,
+        "expected at least two folds for the bold delimiters, got {fold_count}"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_no_folds_on_non_markdown_buffer(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    // Plain-text buffer (no language set) — live preview must stay inactive.
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state(indoc! {"
+        ## Not a headingˇ
+
+        **not bold**
+    "});
+    cx.run_until_parked();
+
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len())
+            .count()
+    });
+    assert_eq!(
+        fold_count, 0,
+        "expected no folds on a non-Markdown buffer even when live_preview is enabled"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_fenced_code_block_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        ```rust
+        let answer = 42;
+        ```
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the fenced code preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_blockquote_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        > hello
+        > world
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the blockquote preview"
+    );
 }

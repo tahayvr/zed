@@ -176,6 +176,8 @@ pub enum HighlightKey {
     HoveredLinkState,
     InlineAssist,
     InputComposition,
+    MarkdownLivePreview(usize),
+    MarkdownLivePreviewBackground,
     MatchingBracket,
     NavigationOverlay(NavigationOverlayKey),
     PendingInput,
@@ -981,6 +983,7 @@ impl DisplayMap {
                     merge_adjacent: base_placeholder.merge_adjacent,
                     type_tag: base_placeholder.type_tag,
                     collapsed_text: Some(collapsed_text),
+                    hide_fold_indicator: base_placeholder.hide_fold_indicator,
                 }
             } else {
                 base_placeholder.clone()
@@ -1826,9 +1829,7 @@ impl DisplaySnapshot {
                             color
                         }
                     }),
-                    underline: chunk_highlight
-                        .underline
-                        .filter(|_| editor_style.show_underlines),
+                    underline: chunk_highlight.underline,
                     ..chunk_highlight
                 }
             });

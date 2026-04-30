@@ -261,6 +261,9 @@ pub struct EditorSettingsContent {
     ///
     /// Default: 100
     pub minimum_split_diff_width: Option<f32>,
+
+    /// Markdown-specific editor settings.
+    pub markdown: Option<MarkdownContent>,
 }
 
 #[derive(
@@ -953,6 +956,19 @@ pub struct JupyterContent {
     ///
     /// Default: `{}`
     pub kernel_selections: Option<HashMap<String, String>>,
+}
+
+/// Markdown-specific editor settings.
+#[with_fallible_options]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub struct MarkdownContent {
+    /// Whether to enable live preview mode for Markdown files, which hides
+    /// syntax markers when the cursor is not on them and renders rich text
+    /// styling (bold, italic, heading colors) inline in the editor.
+    ///
+    /// Default: false
+    pub live_preview: Option<bool>,
 }
 
 /// Whether to allow drag and drop text selection in buffer.
