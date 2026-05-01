@@ -6,13 +6,20 @@ use collections::HashSet;
 use futures::FutureExt;
 use gpui::{
     App, Context, FontStyle, FontWeight, HighlightStyle, ImageSource, IntoElement, ParentElement,
-    Styled, StyledImage, StyledText, Task, WeakEntity, Window, div, px,
+    MouseButton, Refineable, StrikethroughStyle, Styled, StyledImage, StyledText, Task,
+    WeakEntity, Window, div, px,
 };
 use gpui::prelude::InteractiveElement as _;
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
+use markdown::{
+    MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM, MarkdownFont, MarkdownStyle,
+    apply_markdown_heading_style_for_level, markdown_blockquote_style, markdown_list_item_style,
+    markdown_paragraph_style, render_markdown_paragraph_lines,
+};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
 use theme::ActiveTheme;
+use ui::FluentBuilder;
 
 use crate::display_map::{
     BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId, FoldPlaceholder,
@@ -21,11 +28,15 @@ use crate::display_map::{
 use crate::editor_settings::EditorSettings;
 use crate::Editor;
 
-/// Fallback editor-line height for image previews when dimensions are unavailable.
 const IMAGE_BLOCK_FALLBACK_HEIGHT_LINES: u32 = 18;
 const IMAGE_BLOCK_MIN_HEIGHT_LINES: u32 = 6;
 const IMAGE_BLOCK_MAX_HEIGHT_LINES: u32 = 32;
+const IMAGE_BLOCK_MAX_VISIBLE_LINE_FRACTION: f64 = 0.6;
 const IMAGE_BLOCK_MAX_WIDTH_PX: f32 = 900.0;
+const IMAGE_ESTIMATED_LINE_HEIGHT_PX: f32 = 20.0;
+const PREVIEW_LIST_LINE_HEIGHT_REMS: f32 = 1.3;
+const HORIZONTAL_RULE_BLOCK_HEIGHT_LINES: u32 = 2;
+const ACTIVE_SOURCE_BACKGROUND_ALPHA: f32 = 0.35;
 
 /// Type tag used to identify folds created by the markdown live preview feature.
 /// This allows selective removal without disturbing other fold types.
@@ -72,20 +83,28 @@ pub struct MarkdownDecoratorNode {
     pub code_language: Option<String>,
     /// Rendered preview text for block-level markdown nodes.
     pub preview_text: Option<String>,
+    /// Preferred cursor target when clicking a replacement preview block.
+    pub cursor_anchor: Option<Anchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownNodeKind {
     Heading(u8),
+    Paragraph,
     Bold,
     Italic,
     BoldItalic,
+    Strikethrough,
     InlineCode,
     Link,
     Image,
     Checkbox { checked: bool },
     FencedCode,
     Blockquote,
+    HorizontalRule,
+    Table,
+    HtmlBlock,
+    List,
 }
 
 impl MarkdownLivePreview {
@@ -154,6 +173,7 @@ pub fn update_folds(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
     let nodes = preview.nodes.clone();
 
     let mut to_fold: Vec<Crease<Anchor>> = Vec::new();
+    let mut active_source_ranges: Vec<Range<Anchor>> = Vec::new();
     // All decorator ranges across every node — used to sweep out any lingering
     // non-typed folds (e.g. folds restored from a previous session's DB state before
     // the fix that prevents markdown live preview folds from being persisted).
@@ -166,6 +186,10 @@ pub fn update_folds(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
         let cursor_inside = cursor_offsets
             .iter()
             .any(|&offset| offset >= node_start && offset <= node_end);
+
+        if cursor_inside && uses_replacement_preview(node.kind) {
+            active_source_ranges.push(node.full_range.clone());
+        }
 
         for range in &node.decorator_ranges {
             all_decorator_ranges.push(range.clone());
@@ -191,10 +215,6 @@ pub fn update_folds(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
     let full_range = multi_snapshot.anchor_before(MultiBufferOffset(0))
         ..multi_snapshot.anchor_after(MultiBufferOffset(buffer_len));
 
-    // Remove any non-typed folds sitting at our decorator positions. This handles folds
-    // that were incorrectly persisted to the DB by an older version of the code and
-    // subsequently restored on file open (those have no type_tag and thus survive
-    // remove_folds_with_type below).
     if !all_decorator_ranges.is_empty() {
         editor.unfold_ranges(&all_decorator_ranges, true, false, cx);
     }
@@ -210,16 +230,43 @@ pub fn update_folds(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
         editor.fold_creases(to_fold, false, window, cx);
     }
 
+    apply_active_source_highlights(editor, active_source_ranges, cx);
     apply_blocks(editor, &nodes, &cursor_offsets, &multi_snapshot, cx);
 }
 
+fn apply_active_source_highlights(
+    editor: &mut Editor,
+    ranges: Vec<Range<Anchor>>,
+    cx: &mut Context<Editor>,
+) {
+    editor.clear_background_highlights(HighlightKey::MarkdownLivePreviewActiveSource, cx);
+
+    if !ranges.is_empty() {
+        editor.highlight_background(
+            HighlightKey::MarkdownLivePreviewActiveSource,
+            &ranges,
+            |_index, theme| {
+                let mut color = theme.colors().editor_document_highlight_read_background;
+                color.a *= ACTIVE_SOURCE_BACKGROUND_ALPHA;
+                color
+            },
+            cx,
+        );
+    }
+}
+
 fn uses_replacement_preview(kind: MarkdownNodeKind) -> bool {
-    matches!(
+        matches!(
         kind,
         MarkdownNodeKind::Heading(_)
+            | MarkdownNodeKind::Paragraph
             | MarkdownNodeKind::Image
             | MarkdownNodeKind::FencedCode
             | MarkdownNodeKind::Blockquote
+            | MarkdownNodeKind::HorizontalRule
+            | MarkdownNodeKind::Table
+            | MarkdownNodeKind::HtmlBlock
+            | MarkdownNodeKind::List
     )
 }
 
@@ -238,6 +285,7 @@ pub fn remove_all(editor: &mut Editor, cx: &mut Context<Editor>) {
     );
     editor.clear_highlights_with(&mut |key| matches!(key, HighlightKey::MarkdownLivePreview(_)), cx);
     editor.clear_background_highlights(HighlightKey::MarkdownLivePreviewBackground, cx);
+    editor.clear_background_highlights(HighlightKey::MarkdownLivePreviewActiveSource, cx);
 
     if let Some(preview) = editor.markdown_live_preview.as_mut() {
         let block_ids = std::mem::take(&mut preview.block_ids);
@@ -348,6 +396,7 @@ fn apply_blocks(
 
     let mut new_blocks: Vec<BlockProperties<Anchor>> = Vec::new();
     let weak_editor = cx.weak_entity();
+    let visible_line_count = editor.visible_line_count().map(|count| count as u32);
 
     for node in nodes {
         let node_start = node.full_range.start.to_offset(multi_snapshot).0;
@@ -368,7 +417,29 @@ fn apply_blocks(
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(heading_block_height(level)),
                     style: BlockStyle::Flex,
-                    render: render_heading_block(text, level, node.full_range.start, weak_editor.clone()),
+                    render: render_heading_block(
+                        text,
+                        level,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
+                    priority: 0,
+                });
+            }
+            MarkdownNodeKind::Paragraph => {
+                let Some(text) = node.preview_text.clone() else {
+                    continue;
+                };
+                let height = preview_block_height(text.lines().count(), 14.0 * MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM, 8.0);
+                new_blocks.push(BlockProperties {
+                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: render_paragraph_block(
+                        text,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
                     priority: 0,
                 });
             }
@@ -377,11 +448,20 @@ fn apply_blocks(
                     continue;
                 };
                 let resolved_url = resolve_image_url(url_text, base_dir.as_deref());
-                let image_height = image_block_height_lines(&resolved_url);
-                let render = render_image_block(resolved_url, node.full_range.start, weak_editor.clone());
+                let estimated_width = editor
+                    .visible_column_count()
+                    .map(|columns| (columns as f32 * 8.0).min(IMAGE_BLOCK_MAX_WIDTH_PX))
+                    .unwrap_or(IMAGE_BLOCK_MAX_WIDTH_PX);
+                let image_metadata = image_block_metadata(&resolved_url, estimated_width, visible_line_count);
+                let render = render_image_block(
+                    resolved_url,
+                    image_metadata,
+                    node.cursor_anchor.unwrap_or(node.full_range.start),
+                    weak_editor.clone(),
+                );
                 new_blocks.push(BlockProperties {
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
-                    height: Some(image_height),
+                    height: Some(image_metadata.height_lines),
                     style: BlockStyle::Flex,
                     render,
                     priority: 0,
@@ -391,7 +471,9 @@ fn apply_blocks(
                 let Some(text) = node.preview_text.clone() else {
                     continue;
                 };
-                let height = preview_text_height(&text, 2);
+                let text = trim_trailing_empty_lines(&text).to_string();
+                let line_height = 14.0 * 1.75;
+                let height = preview_block_height(text.lines().count(), line_height, 28.0);
                 let language = node.code_language.as_deref().and_then(|language_name| {
                     let registry = editor
                         .buffer()
@@ -414,7 +496,12 @@ fn apply_blocks(
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: render_code_block(text, language, node.full_range.start, weak_editor.clone()),
+                    render: render_code_block(
+                        text,
+                        language,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
                     priority: 0,
                 });
             }
@@ -422,12 +509,79 @@ fn apply_blocks(
                 let Some(text) = node.preview_text.clone() else {
                     continue;
                 };
-                let height = preview_text_height(&text, 1);
+                let height = preview_block_height(text.lines().count(), 14.0 * 1.75, 8.0);
                 new_blocks.push(BlockProperties {
                     placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: render_blockquote_block(text, node.full_range.start, weak_editor.clone()),
+                    render: render_blockquote_block(
+                        text,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
+                    priority: 0,
+                });
+            }
+            MarkdownNodeKind::HorizontalRule => {
+                new_blocks.push(BlockProperties {
+                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    height: Some(HORIZONTAL_RULE_BLOCK_HEIGHT_LINES),
+                    style: BlockStyle::Flex,
+                    render: render_horizontal_rule_block(
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
+                    priority: 0,
+                });
+            }
+            MarkdownNodeKind::Table => {
+                let Some(text) = node.preview_text.clone() else {
+                    continue;
+                };
+                let height = preview_block_height(text.lines().count(), 14.0 * 1.75, 12.0);
+                new_blocks.push(BlockProperties {
+                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: render_table_block(
+                        text,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
+                    priority: 0,
+                });
+            }
+            MarkdownNodeKind::HtmlBlock => {
+                let Some(text) = node.preview_text.clone() else {
+                    continue;
+                };
+                let height = preview_block_height(text.lines().count(), 14.0 * 1.75, 24.0);
+                new_blocks.push(BlockProperties {
+                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: render_html_block(
+                        text,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
+                    priority: 0,
+                });
+            }
+            MarkdownNodeKind::List => {
+                let Some(text) = node.preview_text.clone() else {
+                    continue;
+                };
+                let height = preview_block_height(text.lines().count(), 14.0 * PREVIEW_LIST_LINE_HEIGHT_REMS, 6.0);
+                new_blocks.push(BlockProperties {
+                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: render_list_block(
+                        text,
+                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        weak_editor.clone(),
+                    ),
                     priority: 0,
                 });
             }
@@ -443,34 +597,63 @@ fn apply_blocks(
     }
 }
 
-fn preview_text_height(text: &str, extra_lines: u32) -> u32 {
-    text.lines().count().max(1) as u32 + extra_lines
+fn preview_block_height(line_count: usize, line_height: f32, vertical_padding: f32) -> u32 {
+    ((line_count.max(1) as f32 * line_height + vertical_padding) / IMAGE_ESTIMATED_LINE_HEIGHT_PX)
+        .ceil() as u32
 }
 
 fn heading_block_height(level: u8) -> u32 {
     match level {
-        1 | 2 => 2,
-        _ => 1,
+        1 => 3,
+        2 => 2,
+        _ => 2,
     }
 }
 
-fn image_block_height_lines(resolved_url: &str) -> u32 {
+#[derive(Clone, Copy)]
+struct ImageBlockMetadata {
+    height_lines: u32,
+    loaded_local_dimensions: bool,
+}
+
+fn image_block_metadata(
+    resolved_url: &str,
+    available_width: f32,
+    visible_line_count: Option<u32>,
+) -> ImageBlockMetadata {
+    let height_lines = image_block_height_lines(resolved_url, available_width, visible_line_count);
+    ImageBlockMetadata {
+        height_lines,
+        loaded_local_dimensions: !resolved_url.contains("://")
+            && image::image_dimensions(resolved_url).is_ok(),
+    }
+}
+
+fn image_block_height_lines(
+    resolved_url: &str,
+    available_width: f32,
+    visible_line_count: Option<u32>,
+) -> u32 {
+    let max_height_lines = visible_line_count
+        .map(|line_count| ((line_count as f64 * IMAGE_BLOCK_MAX_VISIBLE_LINE_FRACTION).ceil() as u32)
+            .clamp(IMAGE_BLOCK_MIN_HEIGHT_LINES, IMAGE_BLOCK_MAX_HEIGHT_LINES))
+        .unwrap_or(IMAGE_BLOCK_MAX_HEIGHT_LINES);
+
     if resolved_url.contains("://") {
-        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES.min(max_height_lines);
     }
 
     let Ok((width, height)) = image::image_dimensions(resolved_url) else {
-        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES.min(max_height_lines);
     };
     if width == 0 || height == 0 {
-        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES;
+        return IMAGE_BLOCK_FALLBACK_HEIGHT_LINES.min(max_height_lines);
     }
 
-    let rendered_width = (width as f32).min(IMAGE_BLOCK_MAX_WIDTH_PX);
+    let rendered_width = (width as f32).min(available_width.max(1.0));
     let rendered_height = rendered_width * height as f32 / width as f32;
-    let estimated_line_height = 20.0;
-    ((rendered_height / estimated_line_height).ceil() as u32 + 1)
-        .clamp(IMAGE_BLOCK_MIN_HEIGHT_LINES, IMAGE_BLOCK_MAX_HEIGHT_LINES)
+    ((rendered_height / IMAGE_ESTIMATED_LINE_HEIGHT_PX).ceil() as u32 + 1)
+        .clamp(IMAGE_BLOCK_MIN_HEIGHT_LINES, max_height_lines)
 }
 
 /// Resolves an image URL to an absolute string suitable for display.
@@ -489,7 +672,8 @@ fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
 /// Captures only a `String` (Send + Sync) to avoid ImageSource::Custom's non-Send dyn Fn.
 fn render_image_block(
     resolved_url: String,
-    source_anchor: Anchor,
+    metadata: ImageBlockMetadata,
+    cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let resolved_url: Arc<str> = resolved_url.into();
@@ -503,14 +687,34 @@ fn render_image_block(
         } else {
             ImageSource::from(std::path::PathBuf::from(resolved_url.as_ref()))
         };
-        let max_width = cx.max_width.min(px(IMAGE_BLOCK_MAX_WIDTH_PX));
+        let max_width = cx.max_width;
         let mut container = div()
             .ml(cx.anchor_x)
             .w_full()
             .max_w(max_width)
             .h_full()
             .py_0p5();
-        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        if !metadata.loaded_local_dimensions && !resolved_url.contains("://") {
+            let colors = cx.app.theme().colors();
+            return container
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.element_background)
+                .text_color(colors.text_muted)
+                .font(cx.editor_style.text.font())
+                .child(
+                    div()
+                        .h_full()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child("Image unavailable"),
+                )
+                .into_any_element();
+        }
         container
             .child(gpui::img(source).object_fit(gpui::ObjectFit::Contain).w_full().h_full())
             .into_any_element()
@@ -520,32 +724,36 @@ fn render_image_block(
 fn render_code_block(
     text: String,
     language: Option<Arc<Language>>,
-    source_anchor: Anchor,
+    cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
         let colors = cx.app.theme().colors();
         let text_style = cx.editor_style.text.clone();
+        let mut code_block_style = markdown_style.code_block;
+        code_block_style.margin = Default::default();
         let mut container = div()
             .ml(cx.anchor_x)
-            .max_w(cx.max_width)
             .w_full()
             .h_full()
-            .px_2()
-            .py_1()
             .rounded_lg()
-            .bg(colors.editor_background)
-            .border_1()
-            .border_color(colors.border_variant)
+            .relative()
             .font(cx.editor_style.text.font())
             .text_color(colors.text)
-            .line_height(cx.line_height);
-        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+            .line_height(cx.line_height)
+            .overflow_x_hidden();
+        container.style().refine(&code_block_style);
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
             .children(code_lines(text.as_ref(), language.as_ref(), &text_style, cx.app))
             .into_any_element()
     })
+}
+
+fn trim_trailing_empty_lines(text: &str) -> &str {
+    text.trim_end_matches(['\n', '\r'])
 }
 
 fn code_lines(
@@ -560,7 +768,7 @@ fn code_lines(
                 .map(|language| syntax_highlights_for_line(line, language, cx))
                 .unwrap_or_default();
             div()
-                .h_5()
+                .whitespace_nowrap()
                 .child(StyledText::new(line.to_string()).with_default_highlights(text_style, highlights))
                 .into_any_element()
         })
@@ -589,42 +797,112 @@ fn syntax_highlights_for_line(
 fn render_heading_block(
     text: String,
     level: u8,
-    source_anchor: Anchor,
+    cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let colors = cx.app.theme().colors();
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
         let mut element = div()
             .ml(cx.anchor_x)
             .max_w(cx.max_width)
             .w_full()
             .h_full()
-            .font(cx.editor_style.text.font())
-            .text_color(colors.text)
-            .font_weight(FontWeight::BOLD)
-            .line_height(cx.line_height)
+            .mt_4()
+            .mb_2()
             .child(text.as_ref().to_string());
-        attach_source_click_handler(&mut element, source_anchor, weak_editor.clone());
+        element.style().refine(&markdown_style.heading);
+        attach_source_click_handler(&mut element, cursor_anchor, weak_editor.clone());
 
-        match level {
-            1 => element.text_3xl(),
-            2 => element.text_2xl(),
-            3 => element.text_xl(),
-            4 => element.text_lg(),
-            5 => element.text_base(),
-            _ => element.text_sm(),
-        }
-        .into_any_element()
+        apply_markdown_heading_style_for_level(
+            element,
+            level,
+            markdown_style.heading_level_styles.as_ref(),
+        )
+            .into_any_element()
+    })
+}
+
+fn render_paragraph_block(
+    text: String,
+    cursor_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
+    let text: Arc<str> = text.into();
+    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let mut container = markdown_paragraph_style(false)
+            .ml(cx.anchor_x)
+            .max_w(cx.max_width)
+            .w_full()
+            .h_full()
+            .font(markdown_style.base_text_style.font())
+            .text_color(markdown_style.base_text_style.color);
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        container
+            .children(render_markdown_paragraph_lines(text.as_ref(), &markdown_style))
+            .into_any_element()
     })
 }
 
 fn render_blockquote_block(
     text: String,
-    source_anchor: Anchor,
+    cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
+    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let callout = parse_callout_header(text.as_ref());
+        let border_color = callout
+            .map(|callout| callout.color(&markdown_style))
+            .unwrap_or(markdown_style.block_quote_border_color);
+        let text_color = markdown_style
+            .block_quote
+            .color
+            .unwrap_or_else(|| cx.app.theme().colors().text_muted);
+        let mut container = markdown_blockquote_style(border_color)
+            .ml(cx.anchor_x)
+            .max_w(cx.max_width)
+            .w_full()
+            .h_full()
+            .font(cx.editor_style.text.font())
+            .text_color(text_color)
+            .line_height(cx.line_height);
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let body = blockquote_preview_body(text.as_ref(), callout);
+        container
+            .when_some(callout, |this, callout| this.child(callout.render_header(border_color)))
+            .children(render_markdown_paragraph_lines(body, &markdown_style))
+            .into_any_element()
+    })
+}
+
+fn render_horizontal_rule_block(
+    cursor_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
+    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let mut container = div()
+            .ml(cx.anchor_x)
+            .max_w(cx.max_width)
+            .w_full()
+            .h_full()
+            .my_2();
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        container
+            .child(div().w_full().border_t_1().border_color(markdown_style.rule_color))
+            .into_any_element()
+    })
+}
+
+fn render_table_block(
+    text: String,
+    cursor_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
+    let rows: Arc<[Vec<String>]> = parse_table_rows(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let mut container = div()
@@ -632,37 +910,286 @@ fn render_blockquote_block(
             .max_w(cx.max_width)
             .w_full()
             .h_full()
-            .pl_4()
-            .border_l_4()
+            .overflow_hidden()
+            .rounded_sm()
+            .border(px(1.5))
             .border_color(colors.border)
+            .mb_2()
             .font(cx.editor_style.text.font())
-            .text_color(colors.text_muted)
+            .text_color(colors.text)
             .line_height(cx.line_height);
-        attach_source_click_handler(&mut container, source_anchor, weak_editor.clone());
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
-            .children(text_lines(text.as_ref()))
+            .children(rows.iter().enumerate().map(|(row_index, row)| {
+                let is_header = row_index == 0;
+                div()
+                    .flex()
+                    .w_full()
+                    .min_h(cx.line_height)
+                    .when(is_header, |this| this.bg(colors.title_bar_background))
+                    .when(!is_header && row_index % 2 == 1, |this| this.bg(colors.panel_background))
+                    .when(row_index > 0, |this| {
+                        this.border_t_1().border_color(colors.border)
+                    })
+                    .children(row.iter().map(move |cell| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_1()
+                            .py_0p5()
+                            .when(is_header, |this| this.font_weight(FontWeight::SEMIBOLD))
+                            .child(cell.clone())
+                    }))
+            }))
             .into_any_element()
     })
 }
 
-fn attach_source_click_handler(
-    element: &mut gpui::Div,
-    source_anchor: Anchor,
+fn render_html_block(
+    text: String,
+    cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
-) {
-    element.interactivity().on_click(move |_, window, cx| {
-        let _ = weak_editor.update(cx, |editor, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([source_anchor..source_anchor]);
-            });
-        });
-    });
+) -> RenderBlock {
+    let text: Arc<str> = text.into();
+    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let colors = cx.app.theme().colors();
+        let text_style = cx.editor_style.text.clone();
+        let mut container = div()
+            .ml(cx.anchor_x)
+            .max_w(cx.max_width)
+            .w_full()
+            .h_full()
+            .px_2()
+            .py_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.element_background)
+            .font(cx.editor_style.text.font())
+            .text_color(colors.text_muted)
+            .line_height(cx.line_height)
+            .overflow_hidden();
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        container
+            .children(code_lines(text.as_ref(), None, &text_style, cx.app))
+            .into_any_element()
+    })
 }
 
-fn text_lines(text: &str) -> Vec<gpui::AnyElement> {
+fn render_list_block(
+    text: String,
+    cursor_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> RenderBlock {
+    let items: Arc<[RenderedListItem]> = parse_list_items(&text).into();
+    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+        let colors = cx.app.theme().colors();
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let mut container = div()
+            .ml(cx.anchor_x)
+            .max_w(cx.max_width)
+            .w_full()
+            .h_full()
+            .pl_2p5()
+            .font(cx.editor_style.text.font())
+            .text_color(colors.text)
+            .line_height(cx.line_height * (MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM / 1.75));
+        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        container
+            .children(items.iter().map(|item| {
+                render_list_item(item, colors.text_muted, &markdown_style)
+            }))
+            .into_any_element()
+    })
+}
+
+fn render_list_item(
+    item: &RenderedListItem,
+    marker_color: gpui::Hsla,
+    markdown_style: &MarkdownStyle,
+) -> gpui::AnyElement {
+    markdown_list_item_style(false)
+        .mb_1()
+        .pl(px(item.indent_columns as f32 * 12.0))
+        .child(
+            div()
+                .w(px(16.0))
+                .flex_none()
+                .text_color(marker_color)
+                .child(item.marker.clone()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .w_0()
+                .children(render_markdown_paragraph_lines(&item.text, markdown_style)),
+        )
+        .into_any_element()
+}
+
+fn attach_source_click_handler(
+    element: &mut gpui::Div,
+    cursor_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) {
+    element
+        .interactivity()
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+        let _ = weak_editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([cursor_anchor..cursor_anchor]);
+            });
+        });
+        });
+}
+
+fn parse_table_rows(text: &str) -> Vec<Vec<String>> {
     text.lines()
-        .map(|line| div().h_5().child(line.to_string()).into_any_element())
+        .filter(|line| !is_table_delimiter_row(line))
+        .map(|line| {
+            line.trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedListItem {
+    indent_columns: usize,
+    marker: String,
+    text: String,
+}
+
+fn parse_list_items(text: &str) -> Vec<RenderedListItem> {
+    text.lines()
+        .filter_map(parse_list_item_line)
+        .collect()
+}
+
+fn parse_list_item_line(line: &str) -> Option<RenderedListItem> {
+    let indent_columns = line.chars().take_while(|char| char.is_whitespace()).count();
+    let trimmed = line.trim_start();
+    let (marker, remaining) = parse_list_marker(trimmed)?;
+    let remaining = remaining.trim_start();
+    let (marker, text) = if let Some(text) = remaining.strip_prefix("[ ]") {
+        ("[ ]".to_string(), text.trim_start().to_string())
+    } else if remaining
+        .get(..3)
+        .is_some_and(|prefix| matches!(prefix, "[x]" | "[X]"))
+    {
+        ("[x]".to_string(), remaining[3..].trim_start().to_string())
+    } else {
+        (marker, remaining.to_string())
+    };
+
+    Some(RenderedListItem {
+        indent_columns,
+        marker,
+        text,
+    })
+}
+
+fn parse_list_marker(text: &str) -> Option<(String, &str)> {
+    let first = text.chars().next()?;
+    if matches!(first, '-' | '+' | '*') {
+        return text
+            .get(first.len_utf8()..)
+            .and_then(|remaining| remaining.starts_with(char::is_whitespace).then(|| ("•".to_string(), remaining)));
+    }
+
+    let marker_end = text
+        .char_indices()
+        .find_map(|(index, char)| matches!(char, '.' | ')').then_some((index, char)))?;
+    let number = &text[..marker_end.0];
+    if number.is_empty() || !number.chars().all(|char| char.is_ascii_digit()) {
+        return None;
+    }
+    let remaining = &text[marker_end.0 + marker_end.1.len_utf8()..];
+    remaining
+        .starts_with(char::is_whitespace)
+        .then(|| (format!("{}.", number), remaining))
+}
+
+fn is_table_delimiter_row(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('|').trim();
+    !trimmed.is_empty()
+        && trimmed
+            .split('|')
+            .all(|cell| cell.trim().chars().all(|char| matches!(char, '-' | ':')))
+}
+
+fn blockquote_preview_body(text: &str, callout: Option<LivePreviewCalloutKind>) -> &str {
+    if callout.is_none() {
+        return text;
+    }
+
+    text.lines()
+        .next()
+        .and_then(|first_line| text.strip_prefix(first_line))
+        .map(|remaining| remaining.strip_prefix('\n').unwrap_or(remaining))
+        .unwrap_or(text)
+}
+
+#[derive(Clone, Copy)]
+enum LivePreviewCalloutKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl LivePreviewCalloutKind {
+    fn color(self, markdown_style: &MarkdownStyle) -> gpui::Hsla {
+        match self {
+            Self::Note => markdown_style.block_quote_kind_colors.note,
+            Self::Tip => markdown_style.block_quote_kind_colors.tip,
+            Self::Important => markdown_style.block_quote_kind_colors.important,
+            Self::Warning => markdown_style.block_quote_kind_colors.warning,
+            Self::Caution => markdown_style.block_quote_kind_colors.caution,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+
+    fn render_header(self, color: gpui::Hsla) -> gpui::AnyElement {
+        div()
+            .mb_1()
+            .font_weight(FontWeight::BOLD)
+            .text_color(color)
+            .child(self.label())
+            .into_any_element()
+    }
+}
+
+fn parse_callout_header(text: &str) -> Option<LivePreviewCalloutKind> {
+    let first_line = text.lines().next()?.trim_start();
+    let label = first_line
+        .strip_prefix("[!")?
+        .split_once(']')?
+        .0
+        .to_ascii_lowercase();
+    match label.as_str() {
+        "note" => Some(LivePreviewCalloutKind::Note),
+        "tip" => Some(LivePreviewCalloutKind::Tip),
+        "important" => Some(LivePreviewCalloutKind::Important),
+        "warning" => Some(LivePreviewCalloutKind::Warning),
+        "caution" => Some(LivePreviewCalloutKind::Caution),
+        _ => None,
+    }
 }
 
 /// Returns the highlight style to apply to the content of a markdown node.
@@ -693,6 +1220,13 @@ fn highlight_style_for_kind(kind: MarkdownNodeKind, cx: &App) -> Option<Highligh
             font_style: Some(FontStyle::Italic),
             ..Default::default()
         }),
+        MarkdownNodeKind::Strikethrough => Some(HighlightStyle {
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: None,
+            }),
+            ..Default::default()
+        }),
         MarkdownNodeKind::InlineCode => Some(HighlightStyle {
             background_color: Some(colors.editor_foreground.opacity(0.08)),
             ..Default::default()
@@ -721,6 +1255,11 @@ fn highlight_style_for_kind(kind: MarkdownNodeKind, cx: &App) -> Option<Highligh
             font_style: Some(FontStyle::Italic),
             ..Default::default()
         }),
+        MarkdownNodeKind::HorizontalRule
+        | MarkdownNodeKind::Table
+        | MarkdownNodeKind::HtmlBlock
+        | MarkdownNodeKind::List
+        | MarkdownNodeKind::Paragraph => None,
     }
 }
 
@@ -756,7 +1295,160 @@ pub fn collect_nodes(
         }
     }
 
+    collect_text_list_nodes(snapshot, multi_snapshot, &mut nodes);
+
+    let nodes = remove_ineligible_paragraph_nodes(nodes, multi_snapshot);
     remove_inline_nodes_inside_fenced_code(nodes, multi_snapshot)
+}
+
+fn remove_ineligible_paragraph_nodes(
+    nodes: Vec<MarkdownDecoratorNode>,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Vec<MarkdownDecoratorNode> {
+    let paragraph_ranges: Vec<Range<usize>> = nodes
+        .iter()
+        .filter(|node| node.kind == MarkdownNodeKind::Paragraph)
+        .map(|node| {
+            node.full_range.start.to_offset(multi_snapshot).0
+                ..node.full_range.end.to_offset(multi_snapshot).0
+        })
+        .collect();
+    let replacement_ranges: Vec<Range<usize>> = nodes
+        .iter()
+        .filter(|node| node.kind != MarkdownNodeKind::Paragraph && uses_replacement_preview(node.kind))
+        .map(|node| {
+            node.full_range.start.to_offset(multi_snapshot).0
+                ..node.full_range.end.to_offset(multi_snapshot).0
+        })
+        .collect();
+    nodes
+        .into_iter()
+        .filter(|node| {
+            if node.kind != MarkdownNodeKind::Paragraph {
+                return true;
+            }
+
+            let node_start = node.full_range.start.to_offset(multi_snapshot).0;
+            let node_end = node.full_range.end.to_offset(multi_snapshot).0;
+
+            !replacement_ranges
+                .iter()
+                .any(|range| node_start >= range.start && node_end <= range.end)
+                && !paragraph_ranges.iter().any(|range| {
+                    range.start != node_start
+                        && node_start >= range.start
+                        && node_end <= range.end
+                })
+        })
+        .collect()
+}
+
+fn collect_text_list_nodes(
+    snapshot: &BufferSnapshot,
+    multi_snapshot: &MultiBufferSnapshot,
+    nodes: &mut Vec<MarkdownDecoratorNode>,
+) {
+    let text = snapshot.chars_for_range(0..snapshot.len()).collect::<String>();
+    let fenced_code_ranges: Vec<Range<usize>> = nodes
+        .iter()
+        .filter(|node| node.kind == MarkdownNodeKind::FencedCode)
+        .map(|node| {
+            node.full_range.start.to_offset(multi_snapshot).0
+                ..node.full_range.end.to_offset(multi_snapshot).0
+        })
+        .collect();
+
+    let existing_list_ranges: Vec<Range<usize>> = nodes
+        .iter()
+        .filter(|node| node.kind == MarkdownNodeKind::List)
+        .map(|node| {
+            node.full_range.start.to_offset(multi_snapshot).0
+                ..node.full_range.end.to_offset(multi_snapshot).0
+        })
+        .collect();
+
+    for (range, text) in text_list_ranges(&text, &fenced_code_ranges, &existing_list_ranges) {
+        let full_range = byte_range_to_anchor_range(range, multi_snapshot);
+        let cursor_anchor = full_range.start;
+        nodes.push(MarkdownDecoratorNode {
+            full_range: full_range.clone(),
+            decorator_ranges: vec![full_range],
+            kind: MarkdownNodeKind::List,
+            background_range: None,
+            image_url: None,
+            code_language: None,
+            preview_text: Some(text),
+            cursor_anchor: Some(cursor_anchor),
+        });
+    }
+}
+
+fn text_list_ranges(
+    text: &str,
+    fenced_code_ranges: &[Range<usize>],
+    existing_list_ranges: &[Range<usize>],
+) -> Vec<(Range<usize>, String)> {
+    let mut ranges = Vec::new();
+    let mut block_start: Option<usize> = None;
+    let mut block_end = 0;
+    let mut block_text = String::new();
+    let mut offset = 0;
+
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        let line_start = offset;
+        let line_end = offset + line.len();
+        offset = line_end;
+
+        let inside_fenced_code = fenced_code_ranges
+            .iter()
+            .any(|range| line_start >= range.start && line_start < range.end);
+        let is_list_line = !inside_fenced_code && parse_list_item_line(line_without_newline).is_some();
+
+        if is_list_line {
+            if block_start.is_none() {
+                block_start = Some(line_start);
+            }
+            block_end = line_end;
+            block_text.push_str(line);
+            continue;
+        }
+
+        push_text_list_range(
+            block_start.take(),
+            block_end,
+            &mut block_text,
+            existing_list_ranges,
+            &mut ranges,
+        );
+    }
+
+    push_text_list_range(
+        block_start,
+        block_end,
+        &mut block_text,
+        existing_list_ranges,
+        &mut ranges,
+    );
+
+    ranges
+}
+
+fn push_text_list_range(
+    block_start: Option<usize>,
+    block_end: usize,
+    block_text: &mut String,
+    existing_list_ranges: &[Range<usize>],
+    ranges: &mut Vec<(Range<usize>, String)>,
+) {
+    if let Some(block_start) = block_start
+        && !existing_list_ranges
+            .iter()
+            .any(|range| block_start >= range.start && block_end <= range.end)
+    {
+        ranges.push((block_start..block_end, block_text.trim_end().to_string()));
+    }
+    block_text.clear();
 }
 
 fn remove_inline_nodes_inside_fenced_code(
@@ -784,6 +1476,7 @@ fn remove_inline_nodes_inside_fenced_code(
                 MarkdownNodeKind::Bold
                     | MarkdownNodeKind::Italic
                     | MarkdownNodeKind::BoldItalic
+                    | MarkdownNodeKind::Strikethrough
                     | MarkdownNodeKind::InlineCode
                     | MarkdownNodeKind::Link
                     | MarkdownNodeKind::Image
@@ -825,6 +1518,15 @@ fn visit_block_nodes(
                     nodes.push(decorator);
                 }
             }
+            "setext_heading" => {
+                if let Some(decorator) = parse_setext_heading(node, snapshot, multi_snapshot) {
+                    nodes.push(decorator);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+                continue;
+            }
             "task_list_marker_unchecked" | "task_list_marker_checked" => {
                 if let Some(decorator) = parse_task_list_marker(node, snapshot, multi_snapshot) {
                     nodes.push(decorator);
@@ -845,6 +1547,43 @@ fn visit_block_nodes(
                 }
                 continue;
             }
+            "thematic_break" => {
+                nodes.push(parse_plain_replacement_block(
+                    node,
+                    multi_snapshot,
+                    MarkdownNodeKind::HorizontalRule,
+                    None,
+                ));
+            }
+            "pipe_table" => {
+                nodes.push(parse_plain_replacement_block(
+                    node,
+                    multi_snapshot,
+                    MarkdownNodeKind::Table,
+                    Some(snapshot.chars_for_range(node.byte_range()).collect()),
+                ));
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+                continue;
+            }
+            "html_block" => {
+                nodes.push(parse_plain_replacement_block(
+                    node,
+                    multi_snapshot,
+                    MarkdownNodeKind::HtmlBlock,
+                    Some(snapshot.chars_for_range(node.byte_range()).collect()),
+                ));
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+                continue;
+            }
+            "paragraph" => {
+                if let Some(decorator) = parse_paragraph(node, snapshot, multi_snapshot) {
+                    nodes.push(decorator);
+                }
+            }
             _ => {}
         }
 
@@ -857,6 +1596,54 @@ fn visit_block_nodes(
             break;
         }
     }
+}
+
+fn parse_plain_replacement_block(
+    node: Node<'_>,
+    multi_snapshot: &MultiBufferSnapshot,
+    kind: MarkdownNodeKind,
+    preview_text: Option<String>,
+) -> MarkdownDecoratorNode {
+    let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
+    MarkdownDecoratorNode {
+        full_range: full_range.clone(),
+        decorator_ranges: vec![full_range],
+        kind,
+        background_range: None,
+        image_url: None,
+        code_language: None,
+        preview_text,
+        cursor_anchor: Some(cursor_anchor),
+    }
+}
+
+fn parse_paragraph(
+    node: Node<'_>,
+    snapshot: &BufferSnapshot,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Option<MarkdownDecoratorNode> {
+    let preview_text = snapshot
+        .chars_for_range(node.byte_range())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if preview_text.is_empty() {
+        return None;
+    }
+
+    let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
+    Some(MarkdownDecoratorNode {
+        full_range: full_range.clone(),
+        decorator_ranges: vec![full_range],
+        kind: MarkdownNodeKind::Paragraph,
+        background_range: None,
+        image_url: None,
+        code_language: None,
+        preview_text: Some(preview_text),
+        cursor_anchor: Some(cursor_anchor),
+    })
 }
 
 /// Collects inline markdown nodes (bold, italic, code spans, links, images).
@@ -898,8 +1685,18 @@ fn visit_inline_nodes(
                     nodes.push(decorator);
                 }
             }
+            "strikethrough" => {
+                if let Some(decorator) = parse_strikethrough_node(node, snapshot, multi_snapshot) {
+                    nodes.push(decorator);
+                }
+            }
             "inline_link" => {
                 if let Some(decorator) = parse_inline_link(node, snapshot, multi_snapshot) {
+                    nodes.push(decorator);
+                }
+            }
+            "uri_autolink" | "email_autolink" => {
+                if let Some(decorator) = parse_autolink(node, multi_snapshot) {
                     nodes.push(decorator);
                 }
             }
@@ -976,6 +1773,7 @@ fn parse_atx_heading(
     let marker_start = marker_range.start.to_offset(multi_snapshot).0;
     let marker_end = marker_range.end.to_offset(multi_snapshot).0;
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = multi_snapshot.anchor_after(MultiBufferOffset(marker_end));
     let mut preview_text = snapshot
         .chars_for_range(node.byte_range())
         .collect::<String>();
@@ -993,6 +1791,65 @@ fn parse_atx_heading(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text.trim().to_string()),
+        cursor_anchor: Some(cursor_anchor),
+    })
+}
+
+fn parse_setext_heading(
+    node: Node<'_>,
+    snapshot: &BufferSnapshot,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Option<MarkdownDecoratorNode> {
+    let mut underline_range: Option<Range<usize>> = None;
+    let mut level = 1;
+
+    let mut child_cursor = node.walk();
+    if child_cursor.goto_first_child() {
+        loop {
+            let child = child_cursor.node();
+            match child.kind() {
+                "setext_h1_underline" => {
+                    underline_range = Some(child.byte_range());
+                    level = 1;
+                    break;
+                }
+                "setext_h2_underline" => {
+                    underline_range = Some(child.byte_range());
+                    level = 2;
+                    break;
+                }
+                _ => {}
+            }
+            if !child_cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    let underline_range = underline_range?;
+    let node_range = node.byte_range();
+    let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
+    let fallback_cursor_anchor = multi_snapshot.anchor_before(MultiBufferOffset(node_range.start));
+    let mut preview_text = snapshot
+        .chars_for_range(node_range.start..underline_range.start)
+        .collect::<String>();
+    let text_start = node_range.start + preview_text.len().saturating_sub(preview_text.trim_start().len());
+    preview_text = preview_text.trim().to_string();
+    let cursor_anchor = if preview_text.is_empty() {
+        fallback_cursor_anchor
+    } else {
+        multi_snapshot.anchor_after(MultiBufferOffset(text_start))
+    };
+
+    Some(MarkdownDecoratorNode {
+        full_range,
+        decorator_ranges: vec![byte_range_to_anchor_range(underline_range, multi_snapshot)],
+        kind: MarkdownNodeKind::Heading(level),
+        background_range: None,
+        image_url: None,
+        code_language: None,
+        preview_text: Some(preview_text),
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1003,6 +1860,7 @@ fn parse_task_list_marker(
 ) -> Option<MarkdownDecoratorNode> {
     let checked = node.kind() == "task_list_marker_checked";
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
@@ -1011,6 +1869,7 @@ fn parse_task_list_marker(
         image_url: None,
         code_language: None,
         preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1089,6 +1948,7 @@ fn parse_fenced_code_block(
     }
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1098,6 +1958,7 @@ fn parse_fenced_code_block(
         image_url: None,
         code_language,
         preview_text,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1152,6 +2013,7 @@ fn parse_blockquote(
 
     let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
     let background_range = Some(byte_range_to_anchor_range(node_range, multi_snapshot));
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1161,6 +2023,7 @@ fn parse_blockquote(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text),
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1221,6 +2084,7 @@ fn parse_emphasis_node(
     };
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1230,6 +2094,45 @@ fn parse_emphasis_node(
         image_url: None,
         code_language: None,
         preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
+    })
+}
+
+fn parse_strikethrough_node(
+    node: Node<'_>,
+    _snapshot: &BufferSnapshot,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Option<MarkdownDecoratorNode> {
+    let mut delimiter_ranges = Vec::new();
+
+    let mut child_cursor = node.walk();
+    if child_cursor.goto_first_child() {
+        loop {
+            let child = child_cursor.node();
+            if child.kind() == "emphasis_delimiter" {
+                delimiter_ranges.push(byte_range_to_anchor_range(child.byte_range(), multi_snapshot));
+            }
+            if !child_cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    if delimiter_ranges.is_empty() {
+        return None;
+    }
+
+    let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
+    Some(MarkdownDecoratorNode {
+        full_range,
+        decorator_ranges: delimiter_ranges,
+        kind: MarkdownNodeKind::Strikethrough,
+        background_range: None,
+        image_url: None,
+        code_language: None,
+        preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1259,6 +2162,7 @@ fn parse_code_span(
     }
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1268,6 +2172,33 @@ fn parse_code_span(
         image_url: None,
         code_language: None,
         preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
+    })
+}
+
+fn parse_autolink(
+    node: Node<'_>,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Option<MarkdownDecoratorNode> {
+    let node_range = node.byte_range();
+    if node_range.end.saturating_sub(node_range.start) < 2 {
+        return None;
+    }
+
+    let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
+    let cursor_anchor = full_range.start;
+    Some(MarkdownDecoratorNode {
+        full_range,
+        decorator_ranges: vec![
+            byte_range_to_anchor_range(node_range.start..node_range.start + 1, multi_snapshot),
+            byte_range_to_anchor_range(node_range.end - 1..node_range.end, multi_snapshot),
+        ],
+        kind: MarkdownNodeKind::Link,
+        background_range: None,
+        image_url: None,
+        code_language: None,
+        preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1303,6 +2234,7 @@ fn parse_inline_link(
     let tail = byte_range_to_anchor_range(link_text_range.end..node_range.end, multi_snapshot);
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1312,6 +2244,7 @@ fn parse_inline_link(
         image_url: None,
         code_language: None,
         preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1372,6 +2305,7 @@ fn parse_image(
     };
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
+    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1381,6 +2315,7 @@ fn parse_image(
         image_url,
         code_language: None,
         preview_text: None,
+        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1437,7 +2372,7 @@ mod tests {
     #[test]
     fn test_image_block_height_uses_fallback_for_remote_images() {
         assert_eq!(
-            image_block_height_lines("https://example.com/image.png"),
+            image_block_height_lines("https://example.com/image.png", IMAGE_BLOCK_MAX_WIDTH_PX, None),
             IMAGE_BLOCK_FALLBACK_HEIGHT_LINES
         );
     }
@@ -1445,8 +2380,89 @@ mod tests {
     #[test]
     fn test_image_block_height_uses_fallback_for_missing_local_images() {
         assert_eq!(
-            image_block_height_lines("/tmp/definitely-missing-image.png"),
+            image_block_height_lines(
+                "/tmp/definitely-missing-image.png",
+                IMAGE_BLOCK_MAX_WIDTH_PX,
+                None,
+            ),
             IMAGE_BLOCK_FALLBACK_HEIGHT_LINES
         );
+    }
+
+    #[test]
+    fn test_image_block_height_caps_to_visible_lines() {
+        assert_eq!(
+            image_block_height_lines("https://example.com/image.png", IMAGE_BLOCK_MAX_WIDTH_PX, Some(10)),
+            6
+        );
+    }
+
+    #[test]
+    fn test_trim_trailing_empty_lines() {
+        assert_eq!(trim_trailing_empty_lines("a\n\n"), "a");
+        assert_eq!(trim_trailing_empty_lines("a\n b\n"), "a\n b");
+    }
+
+    #[test]
+    fn test_parse_callout_header() {
+        assert!(matches!(
+            parse_callout_header("[!warning]\nBe careful"),
+            Some(LivePreviewCalloutKind::Warning)
+        ));
+        assert!(parse_callout_header("regular quote").is_none());
+    }
+
+    #[test]
+    fn test_heading_block_height_leaves_preview_spacing() {
+        assert_eq!(heading_block_height(1), 3);
+        assert_eq!(heading_block_height(3), 2);
+    }
+
+    #[test]
+    fn test_parse_list_items() {
+        assert_eq!(
+            parse_list_items("- one\n  - [x] nested\n2. two"),
+            vec![
+                RenderedListItem {
+                    indent_columns: 0,
+                    marker: "•".to_string(),
+                    text: "one".to_string(),
+                },
+                RenderedListItem {
+                    indent_columns: 2,
+                    marker: "[x]".to_string(),
+                    text: "nested".to_string(),
+                },
+                RenderedListItem {
+                    indent_columns: 0,
+                    marker: "2.".to_string(),
+                    text: "two".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_text_list_node_detection() {
+        let text = "- one\n- two\n\nSome other text";
+        let ranges = text_list_ranges(text, &[], &[]);
+        assert_eq!(ranges, vec![(0..12, "- one\n- two".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_table_rows_skips_delimiter_row() {
+        assert_eq!(
+            parse_table_rows("| Name | Value |\n| --- | :---: |\n| A | 1 |"),
+            vec![
+                vec!["Name".to_string(), "Value".to_string()],
+                vec!["A".to_string(), "1".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_table_delimiter_detection() {
+        assert!(is_table_delimiter_row("| --- | :---: | ---: |"));
+        assert!(!is_table_delimiter_row("| Name | Value |"));
     }
 }

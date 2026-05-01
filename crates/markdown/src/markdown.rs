@@ -52,6 +52,173 @@ use util::ResultExt;
 
 use crate::parser::CodeBlockKind;
 
+pub const MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM: f32 = 1.3;
+
+pub fn apply_markdown_heading_style(
+    heading: Div,
+    level: pulldown_cmark::HeadingLevel,
+    custom_styles: Option<&HeadingLevelStyles>,
+) -> Div {
+    apply_heading_style(heading, level, custom_styles)
+}
+
+pub fn apply_markdown_heading_style_for_level(
+    heading: Div,
+    level: u8,
+    custom_styles: Option<&HeadingLevelStyles>,
+) -> Div {
+    apply_heading_style(
+        heading,
+        match level {
+            1 => pulldown_cmark::HeadingLevel::H1,
+            2 => pulldown_cmark::HeadingLevel::H2,
+            3 => pulldown_cmark::HeadingLevel::H3,
+            4 => pulldown_cmark::HeadingLevel::H4,
+            5 => pulldown_cmark::HeadingLevel::H5,
+            _ => pulldown_cmark::HeadingLevel::H6,
+        },
+        custom_styles,
+    )
+}
+
+pub fn markdown_paragraph_style(height_is_multiple_of_line_height: bool) -> Div {
+    div().when(!height_is_multiple_of_line_height, |el| {
+        el.mb_2().line_height(rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM))
+    })
+}
+
+pub fn markdown_list_item_style(height_is_multiple_of_line_height: bool) -> Div {
+    div()
+        .when(!height_is_multiple_of_line_height, |el| {
+            el.mb_1()
+                .gap_1()
+                .line_height(rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM))
+        })
+        .h_flex()
+        .items_start()
+}
+
+pub fn markdown_blockquote_style(border_color: Hsla) -> Div {
+    div().pl_4().mb_2().border_l_4().border_color(border_color)
+}
+
+pub fn render_markdown_paragraph_lines(text: &str, style: &MarkdownStyle) -> Vec<AnyElement> {
+    let parsed = parse_markdown_with_options(text, false, false);
+    let mut lines = vec![RenderedParagraphLine::default()];
+    let mut text_style_stack: Vec<TextStyleRefinement> = Vec::new();
+
+    for (range, event) in parsed.events {
+        match event {
+            MarkdownEvent::Start(tag) => match tag {
+                MarkdownTag::Emphasis => text_style_stack.push(TextStyleRefinement {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                }),
+                MarkdownTag::Strong => text_style_stack.push(TextStyleRefinement {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                }),
+                MarkdownTag::Strikethrough => text_style_stack.push(TextStyleRefinement {
+                    strikethrough: Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: None,
+                    }),
+                    ..Default::default()
+                }),
+                MarkdownTag::Link { dest_url, .. } => {
+                    let _ = dest_url;
+                    text_style_stack.push(style.link.clone());
+                }
+                _ => {}
+            },
+            MarkdownEvent::End(tag) => match tag {
+                MarkdownTagEnd::Emphasis | MarkdownTagEnd::Strong | MarkdownTagEnd::Strikethrough => {
+                    text_style_stack.pop();
+                }
+                MarkdownTagEnd::Link => {
+                    text_style_stack.pop();
+                }
+                _ => {}
+            },
+            MarkdownEvent::Text => push_paragraph_text(
+                &mut lines,
+                &text[range],
+                current_paragraph_text_style(style, &text_style_stack),
+            ),
+            MarkdownEvent::SubstitutedText(substituted) => push_paragraph_text(
+                &mut lines,
+                &substituted,
+                current_paragraph_text_style(style, &text_style_stack),
+            ),
+            MarkdownEvent::Code => {
+                text_style_stack.push(style.inline_code.clone());
+                push_paragraph_text(
+                    &mut lines,
+                    &text[range],
+                    current_paragraph_text_style(style, &text_style_stack),
+                );
+                text_style_stack.pop();
+            }
+            MarkdownEvent::SoftBreak => push_paragraph_text(
+                &mut lines,
+                " ",
+                current_paragraph_text_style(style, &text_style_stack),
+            ),
+            MarkdownEvent::HardBreak => lines.push(RenderedParagraphLine::default()),
+            _ => {}
+        }
+    }
+
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.text.is_empty() {
+                return div().child(" ").into_any_element();
+            }
+
+            div()
+                .child(StyledText::new(line.text).with_runs(line.runs))
+                .into_any_element()
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct RenderedParagraphLine {
+    text: String,
+    runs: Vec<TextRun>,
+}
+
+fn current_paragraph_text_style(
+    style: &MarkdownStyle,
+    text_style_stack: &[TextStyleRefinement],
+) -> TextStyle {
+    let mut text_style = style.base_text_style.clone();
+    for refinement in text_style_stack {
+        text_style.refine(refinement);
+    }
+    text_style
+}
+
+fn push_paragraph_text(lines: &mut Vec<RenderedParagraphLine>, text: &str, text_style: TextStyle) {
+    let mut remaining = text;
+    while let Some((segment, rest)) = remaining.split_once('\n') {
+        if !segment.is_empty() {
+            let line = lines.last_mut().expect("paragraph line always exists");
+            line.text.push_str(segment);
+            line.runs.push(text_style.to_run(segment.len()));
+        }
+        lines.push(RenderedParagraphLine::default());
+        remaining = rest;
+    }
+
+    if !remaining.is_empty() {
+        let line = lines.last_mut().expect("paragraph line always exists");
+        line.text.push_str(remaining);
+        line.runs.push(text_style.to_run(remaining.len()));
+    }
+}
+
 /// A callback function that can be used to customize the style of links based on the destination URL.
 /// If the callback returns `None`, the default link style will be used.
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;

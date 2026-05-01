@@ -177,6 +177,7 @@ pub enum HighlightKey {
     InlineAssist,
     InputComposition,
     MarkdownLivePreview(usize),
+    MarkdownLivePreviewActiveSource,
     MarkdownLivePreviewBackground,
     MatchingBracket,
     NavigationOverlay(NavigationOverlayKey),

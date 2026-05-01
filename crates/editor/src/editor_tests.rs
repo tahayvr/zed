@@ -37431,8 +37431,9 @@ async fn test_markdown_live_preview_folds_heading_marker_when_cursor_away(
 
     // The heading should be replaced with a preview block.
     let block_count = cx.update_editor(|editor, window, cx| {
+        let live_preview_block_count = crate::markdown_live_preview::block_ids(editor).len();
         let snapshot = editor.snapshot(window, cx);
-        snapshot
+        live_preview_block_count + snapshot
             .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
             .count()
     });
@@ -37475,16 +37476,12 @@ async fn test_markdown_live_preview_unfolds_heading_when_cursor_enters(cx: &mut 
     cx.set_state(indoc! {"
         ## A heading
 
-        Some other textˇ
+        Some **other** textˇ
     "});
     cx.run_until_parked();
 
-    let block_count_before = cx.update_editor(|editor, window, cx| {
-        let snapshot = editor.snapshot(window, cx);
-        snapshot
-            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
-            .count()
-    });
+    let block_count_before =
+        cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
     assert!(
         block_count_before >= 1,
         "precondition: expected preview block before cursor enters heading"
@@ -37495,20 +37492,17 @@ async fn test_markdown_live_preview_unfolds_heading_when_cursor_enters(cx: &mut 
     cx.set_selections_state(indoc! {"
         ## A headingˇ
 
-        Some other text
+        Some **other** text
     "});
     cx.run_until_parked();
 
-    // The replacement block should be removed when the cursor enters the heading.
-    let block_count_after = cx.update_editor(|editor, window, cx| {
-        let snapshot = editor.snapshot(window, cx);
-        snapshot
-            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
-            .count()
-    });
-    assert_eq!(
-        block_count_after, 0,
-        "expected no preview block when cursor is inside the heading node"
+    cx.assert_editor_background_highlights(
+        HighlightKey::MarkdownLivePreviewActiveSource,
+        indoc! {"
+            «## A heading
+            »
+            Some **other** text
+        "},
     );
 }
 
@@ -37614,8 +37608,9 @@ async fn test_markdown_live_preview_replaces_fenced_code_block_when_cursor_away(
     cx.run_until_parked();
 
     let block_count = cx.update_editor(|editor, window, cx| {
+        let live_preview_block_count = crate::markdown_live_preview::block_ids(editor).len();
         let snapshot = editor.snapshot(window, cx);
-        snapshot
+        live_preview_block_count + snapshot
             .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
             .count()
     });
@@ -37654,6 +37649,88 @@ async fn test_markdown_live_preview_replaces_blockquote_when_cursor_away(
     cx.run_until_parked();
 
     let block_count = cx.update_editor(|editor, window, cx| {
+        let live_preview_block_count = crate::markdown_live_preview::block_ids(editor).len();
+        let snapshot = editor.snapshot(window, cx);
+        live_preview_block_count
+            + snapshot
+                .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+                .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the blockquote preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_horizontal_rule_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        ---
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let live_preview_block_count = crate::markdown_live_preview::block_ids(editor).len();
+        let snapshot = editor.snapshot(window, cx);
+        live_preview_block_count
+            + snapshot
+                .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+                .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the horizontal rule preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_table_when_cursor_away(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        | Name | Value |
+        | --- | --- |
+        | A | 1 |
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
         let snapshot = editor.snapshot(window, cx);
         snapshot
             .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
@@ -37661,6 +37738,303 @@ async fn test_markdown_live_preview_replaces_blockquote_when_cursor_away(
     });
     assert!(
         block_count >= 1,
-        "expected a replacement block for the blockquote preview"
+        "expected a replacement block for the table preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_setext_heading_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        A heading
+        =========
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the setext heading preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_html_block_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        <!-- custom html -->
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the html block preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_list_when_cursor_away(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        - one
+        - two
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the list preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_task_list_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        - [x] done
+        - [ ] todo
+
+        ˇSome other text
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot
+            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
+            .count()
+    });
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the task list preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_plain_paragraph_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        A plain paragraph without inline markdown.
+
+        Another paragraphˇ
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the plain paragraph preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_inline_markdown_paragraph_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+    language_registry.add(markdown_inline_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        A paragraph with **bold**, `code`, and [a link](https://example.com).
+
+        Another lineˇ
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the inline-markup paragraph preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_inline_markdown_blockquote_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+    language_registry.add(markdown_inline_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        > Quote with **bold** and `code`
+
+        Another lineˇ
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the inline-markup blockquote preview"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_replaces_inline_markdown_list_when_cursor_away(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+    language_registry.add(markdown_inline_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {"
+        - item with **bold**
+        - item with [link](https://example.com)
+
+        Another lineˇ
+    "});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    assert!(
+        block_count >= 1,
+        "expected a replacement block for the inline-markup list preview"
     );
 }
