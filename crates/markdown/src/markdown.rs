@@ -41,8 +41,9 @@ use gpui::{
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
+pub use parser::{MarkdownEvent, MarkdownTag, MarkdownTagEnd};
 use parser::{
-    MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown_with_options,
+    parse_links_only, parse_markdown_with_options,
 };
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
@@ -100,6 +101,271 @@ pub fn markdown_list_item_style(height_is_multiple_of_line_height: bool) -> Div 
 
 pub fn markdown_blockquote_style(border_color: Hsla) -> Div {
     div().pl_4().mb_2().border_l_4().border_color(border_color)
+}
+
+pub fn markdown_paragraph_div(style: &MarkdownStyle, text_align_override: Option<TextAlign>) -> Div {
+    let align = text_align_override.unwrap_or(style.base_text_style.text_align);
+    let paragraph = markdown_paragraph_style(style.height_is_multiple_of_line_height);
+
+    match align {
+        TextAlign::Center => paragraph.text_center(),
+        TextAlign::Left => paragraph.text_left(),
+        TextAlign::Right => paragraph.text_right(),
+    }
+}
+
+pub fn markdown_heading_div(
+    style: &MarkdownStyle,
+    level: pulldown_cmark::HeadingLevel,
+    text_align_override: Option<TextAlign>,
+) -> Div {
+    let align = text_align_override.unwrap_or(style.base_text_style.text_align);
+    let heading = apply_heading_style(div().mt_4().mb_2(), level, style.heading_level_styles.as_ref());
+
+    match align {
+        TextAlign::Center => heading.text_center(),
+        TextAlign::Left => heading.text_left(),
+        TextAlign::Right => heading.text_right(),
+    }
+}
+
+pub fn markdown_heading_div_for_level(
+    style: &MarkdownStyle,
+    level: u8,
+    text_align_override: Option<TextAlign>,
+) -> Div {
+    markdown_heading_div(
+        style,
+        match level {
+            1 => pulldown_cmark::HeadingLevel::H1,
+            2 => pulldown_cmark::HeadingLevel::H2,
+            3 => pulldown_cmark::HeadingLevel::H3,
+            4 => pulldown_cmark::HeadingLevel::H4,
+            5 => pulldown_cmark::HeadingLevel::H5,
+            _ => pulldown_cmark::HeadingLevel::H6,
+        },
+        text_align_override,
+    )
+}
+
+pub fn markdown_blockquote_div(style: &MarkdownStyle, kind: Option<BlockQuoteKind>) -> Div {
+    let border_color = markdown_blockquote_border_color(style, kind);
+    let container = markdown_blockquote_style(border_color);
+
+    match kind.and_then(|kind| markdown_blockquote_header(kind, border_color)) {
+        Some(header) => container.child(header),
+        None => container,
+    }
+}
+
+pub fn markdown_blockquote_border_color(style: &MarkdownStyle, kind: Option<BlockQuoteKind>) -> Hsla {
+    style
+        .block_quote_kind_colors
+        .for_kind(kind, style.block_quote_border_color)
+}
+
+pub fn markdown_list_div() -> Div {
+    div().pl_2p5()
+}
+
+pub fn markdown_list_item_div(style: &MarkdownStyle, bullet: AnyElement) -> Div {
+    markdown_list_item_style(style.height_is_multiple_of_line_height).child(bullet)
+}
+
+pub fn markdown_list_item_content_div() -> Div {
+    div().flex_1().w_0()
+}
+
+pub fn markdown_table_div(
+    style: &MarkdownStyle,
+    column_count: u16,
+    colors: &theme::ThemeColors,
+) -> Div {
+    div()
+        .grid()
+        .grid_cols(column_count)
+        .when(style.table_columns_min_size, |this| {
+            this.grid_cols_min_content(column_count)
+        })
+        .when(!style.table_columns_min_size, |this| this.grid_cols(column_count))
+        .w_full()
+        .mb_2()
+        .border(px(1.5))
+        .border_color(colors.border)
+        .rounded_sm()
+        .overflow_hidden()
+}
+
+pub fn markdown_table_cell_div(
+    is_header: bool,
+    row_index: usize,
+    col_index: usize,
+    colors: &theme::ThemeColors,
+) -> Div {
+    div()
+        .when(col_index > 0, |this| this.border_l_1())
+        .when(row_index > 0, |this| this.border_t_1())
+        .border_color(colors.border)
+        .px_1()
+        .py_0p5()
+        .when(is_header, |this| this.bg(colors.title_bar_background))
+        .when(!is_header && row_index % 2 == 1, |this| this.bg(colors.panel_background))
+}
+
+pub fn markdown_rule_div(style: &MarkdownStyle) -> Div {
+    div().border_b_1().my_2().border_color(style.rule_color)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedMarkdownListItem {
+    pub indent_columns: usize,
+    pub marker: String,
+    pub text: String,
+}
+
+pub fn parse_markdown_table_rows(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter(|line| !is_markdown_table_delimiter_row(line))
+        .map(|line| {
+            line.trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+pub fn parse_markdown_list_items(text: &str) -> Vec<RenderedMarkdownListItem> {
+    text.lines().filter_map(parse_markdown_list_item_line).collect()
+}
+
+pub fn parse_markdown_list_item_line(line: &str) -> Option<RenderedMarkdownListItem> {
+    let indent_columns = line.chars().take_while(|char| char.is_whitespace()).count();
+    let trimmed = line.trim_start();
+    let (marker, remaining) = parse_markdown_list_marker(trimmed)?;
+    let remaining = remaining.trim_start();
+    let (marker, text) = if let Some(text) = remaining.strip_prefix("[ ]") {
+        ("[ ]".to_string(), text.trim_start().to_string())
+    } else if remaining
+        .get(..3)
+        .is_some_and(|prefix| matches!(prefix, "[x]" | "[X]"))
+    {
+        ("[x]".to_string(), remaining[3..].trim_start().to_string())
+    } else {
+        (marker, remaining.to_string())
+    };
+
+    Some(RenderedMarkdownListItem {
+        indent_columns,
+        marker,
+        text,
+    })
+}
+
+pub fn parse_markdown_blockquote_callout(text: &str) -> Option<BlockQuoteKind> {
+    let first_line = text.lines().next()?.trim();
+    let kind = first_line
+        .strip_prefix("[!")?
+        .strip_suffix(']')?
+        .trim()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "note" => Some(BlockQuoteKind::Note),
+        "tip" => Some(BlockQuoteKind::Tip),
+        "important" => Some(BlockQuoteKind::Important),
+        "warning" => Some(BlockQuoteKind::Warning),
+        "caution" => Some(BlockQuoteKind::Caution),
+        _ => None,
+    }
+}
+
+pub fn markdown_blockquote_body(text: &str, callout: Option<BlockQuoteKind>) -> &str {
+    if callout.is_some() {
+        text.split_once('\n').map_or("", |(_, body)| body)
+    } else {
+        text
+    }
+}
+
+pub fn is_markdown_table_delimiter_row(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('|').trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed
+        .split('|')
+        .map(str::trim)
+        .all(|cell| !cell.is_empty() && cell.chars().all(|char| matches!(char, '-' | ':' | ' ')))
+}
+
+pub fn markdown_code_block_parent_div(
+    style: &MarkdownStyle,
+    border_color: Hsla,
+    border: bool,
+) -> Div {
+    let mut container = div().group("code_block").relative().w_full();
+    if border {
+        container = container.rounded_md().border_1().border_color(border_color);
+    }
+    container.style().refine(&style.code_block);
+    container
+}
+
+pub fn markdown_code_block_content_div() -> Div {
+    div().rounded_lg().w_full()
+}
+
+fn markdown_blockquote_header(kind: BlockQuoteKind, border_color: Hsla) -> Option<AnyElement> {
+    let (icon_name, label) = match kind {
+        BlockQuoteKind::Note => (IconName::Info, "Note"),
+        BlockQuoteKind::Tip => (IconName::Sparkle, "Tip"),
+        BlockQuoteKind::Important => (IconName::Chat, "Important"),
+        BlockQuoteKind::Warning => (IconName::Warning, "Warning"),
+        BlockQuoteKind::Caution => (IconName::Stop, "Caution"),
+    };
+
+    Some(
+        h_flex()
+            .gap_1()
+            .items_center()
+            .mb_1()
+            .child(
+                Icon::new(icon_name)
+                    .size(IconSize::Small)
+                    .color(Color::Custom(border_color)),
+            )
+            .child(
+                Label::new(label)
+                    .weight(FontWeight::BOLD)
+                    .color(Color::Custom(border_color)),
+            )
+            .into_any_element(),
+    )
+}
+
+fn parse_markdown_list_marker(text: &str) -> Option<(String, &str)> {
+    let first = text.chars().next()?;
+    if matches!(first, '-' | '+' | '*') {
+        return text.get(first.len_utf8()..).and_then(|remaining| {
+            remaining
+                .starts_with(char::is_whitespace)
+                .then(|| ("•".to_string(), remaining))
+        });
+    }
+
+    let marker_end = text
+        .char_indices()
+        .find_map(|(index, char)| matches!(char, '.' | ')').then_some((index, char)))?;
+    let number = &text[..marker_end.0];
+    if number.is_empty() || !number.chars().all(|char| char.is_ascii_digit()) {
+        return None;
+    }
+    let remaining = &text[marker_end.0 + marker_end.1.len_utf8()..];
+    remaining
+        .starts_with(char::is_whitespace)
+        .then(|| (format!("{}.", number), remaining))
 }
 
 pub fn render_markdown_paragraph_lines(text: &str, style: &MarkdownStyle) -> Vec<AnyElement> {
@@ -181,6 +447,10 @@ pub fn render_markdown_paragraph_lines(text: &str, style: &MarkdownStyle) -> Vec
                 .into_any_element()
         })
         .collect()
+}
+
+pub fn parse_markdown_events(text: &str) -> Arc<[(Range<usize>, MarkdownEvent)]> {
+    parse_markdown_with_options(text, false, false).events.into()
 }
 
 #[derive(Default)]
@@ -1328,15 +1598,7 @@ impl MarkdownElement {
         text_align_override: Option<TextAlign>,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
-        let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
-        });
-
-        paragraph = match align {
-            TextAlign::Center => paragraph.text_center(),
-            TextAlign::Left => paragraph.text_left(),
-            TextAlign::Right => paragraph.text_right(),
-        };
+        let paragraph = markdown_paragraph_div(&self.style, text_align_override);
 
         builder.push_text_style(TextStyleRefinement {
             text_align: Some(align),
@@ -1359,14 +1621,7 @@ impl MarkdownElement {
         text_align_override: Option<TextAlign>,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
-        let mut heading = div().mt_4().mb_2();
-        heading = apply_heading_style(heading, level, self.style.heading_level_styles.as_ref());
-
-        heading = match align {
-            TextAlign::Center => heading.text_center(),
-            TextAlign::Left => heading.text_left(),
-            TextAlign::Right => heading.text_right(),
-        };
+        let mut heading = markdown_heading_div(&self.style, level, text_align_override);
 
         let mut heading_style = self.style.heading.clone();
         let heading_text_style = heading_style.text_style().clone();
@@ -1391,41 +1646,7 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
     ) {
-        let border_color = self
-            .style
-            .block_quote_kind_colors
-            .for_kind(kind, self.style.block_quote_border_color);
-
-        let header = kind.map(|kind| {
-            let (icon_name, label) = match kind {
-                BlockQuoteKind::Note => (IconName::Info, "Note"),
-                BlockQuoteKind::Tip => (IconName::Sparkle, "Tip"),
-                BlockQuoteKind::Important => (IconName::Chat, "Important"),
-                BlockQuoteKind::Warning => (IconName::Warning, "Warning"),
-                BlockQuoteKind::Caution => (IconName::Stop, "Caution"),
-            };
-            h_flex()
-                .gap_1()
-                .items_center()
-                .mb_1()
-                .child(
-                    Icon::new(icon_name)
-                        .size(IconSize::Small)
-                        .color(Color::Custom(border_color)),
-                )
-                .child(
-                    Label::new(label)
-                        .color(Color::Custom(border_color))
-                        .weight(FontWeight::BOLD),
-                )
-                .into_any_element()
-        });
-
-        let block_div = div().pl_4().mb_2().border_l_4().border_color(border_color);
-        let block_div = match header {
-            Some(header) => block_div.child(header),
-            None => block_div,
-        };
+        let block_div = markdown_blockquote_div(&self.style, kind);
 
         builder.push_text_style(self.style.block_quote.clone());
         builder.push_div(block_div, range, markdown_end);
@@ -1443,19 +1664,9 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
     ) {
-        builder.push_div(
-            div()
-                .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
-                })
-                .h_flex()
-                .items_start()
-                .child(bullet),
-            range,
-            markdown_end,
-        );
+        builder.push_div(markdown_list_item_div(&self.style, bullet), range, markdown_end);
         // Without `w_0`, text doesn't wrap to the width of the container.
-        builder.push_div(div().flex_1().w_0(), range, markdown_end);
+        builder.push_div(markdown_list_item_content_div(), range, markdown_end);
     }
 
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
@@ -1958,10 +2169,16 @@ impl Element for MarkdownElement {
                             match (&self.code_block_renderer, is_indented) {
                                 (CodeBlockRenderer::Default { .. }, _) | (_, true) => {
                                     // This is a parent container that we can position the copy button inside.
-                                    let parent_container =
-                                        div().group("code_block").relative().w_full();
+                                    let parent_container = markdown_code_block_parent_div(
+                                        &self.style,
+                                        cx.theme().colors().border_variant,
+                                        matches!(
+                                            &self.code_block_renderer,
+                                            CodeBlockRenderer::Default { border: true, .. }
+                                        ),
+                                    );
 
-                                    let mut parent_container: AnyDiv = if let Some(scroll_handle) =
+                                    let parent_container: AnyDiv = if let Some(scroll_handle) =
                                         scroll_handle.as_ref()
                                     {
                                         let scrollbars = Scrollbars::new(ScrollAxes::Horizontal)
@@ -1981,21 +2198,10 @@ impl Element for MarkdownElement {
                                         parent_container.into()
                                     };
 
-                                    if let CodeBlockRenderer::Default { border: true, .. } =
-                                        &self.code_block_renderer
-                                    {
-                                        parent_container = parent_container
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().colors().border_variant);
-                                    }
-
-                                    parent_container.style().refine(&self.style.code_block);
                                     builder.push_div(parent_container, range, markdown_end);
 
-                                    let code_block = div()
+                                    let code_block = markdown_code_block_content_div()
                                         .id(("code-block", range.start))
-                                        .rounded_lg()
                                         .map(|mut code_block| {
                                             if let Some(scroll_handle) = scroll_handle.as_ref() {
                                                 code_block.style().restrict_scroll_to_axis =
@@ -2025,7 +2231,7 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::List(bullet_index) => {
                             builder.push_list(*bullet_index);
-                            builder.push_div(div().pl_2p5(), range, markdown_end);
+                            builder.push_div(markdown_list_div(), range, markdown_end);
                         }
                         MarkdownTag::Item => {
                             let bullet =
@@ -2133,22 +2339,12 @@ impl Element for MarkdownElement {
 
                             let column_count = alignments.len();
                             builder.push_div(
-                                div()
-                                    .id(("table", range.start))
-                                    .grid()
-                                    .grid_cols(column_count as u16)
-                                    .when(self.style.table_columns_min_size, |this| {
-                                        this.grid_cols_min_content(column_count as u16)
-                                    })
-                                    .when(!self.style.table_columns_min_size, |this| {
-                                        this.grid_cols(column_count as u16)
-                                    })
-                                    .w_full()
-                                    .mb_2()
-                                    .border(px(1.5))
-                                    .border_color(cx.theme().colors().border)
-                                    .rounded_sm()
-                                    .overflow_hidden(),
+                                markdown_table_div(
+                                    &self.style,
+                                    column_count as u16,
+                                    cx.theme().colors(),
+                                )
+                                .id(("table", range.start)),
                                 range,
                                 markdown_end,
                             );
@@ -2169,18 +2365,12 @@ impl Element for MarkdownElement {
                             let col_index = builder.table.col_index;
 
                             builder.push_div(
-                                div()
-                                    .when(col_index > 0, |this| this.border_l_1())
-                                    .when(row_index > 0, |this| this.border_t_1())
-                                    .border_color(cx.theme().colors().border)
-                                    .px_1()
-                                    .py_0p5()
-                                    .when(is_header, |this| {
-                                        this.bg(cx.theme().colors().title_bar_background)
-                                    })
-                                    .when(!is_header && row_index % 2 == 1, |this| {
-                                        this.bg(cx.theme().colors().panel_background)
-                                    }),
+                                markdown_table_cell_div(
+                                    is_header,
+                                    row_index,
+                                    col_index,
+                                    cx.theme().colors(),
+                                ),
                                 range,
                                 markdown_end,
                             );
@@ -2326,14 +2516,7 @@ impl Element for MarkdownElement {
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
                 }
                 MarkdownEvent::Rule => {
-                    builder.push_div(
-                        div()
-                            .border_b_1()
-                            .my_2()
-                            .border_color(self.style.rule_color),
-                        range,
-                        markdown_end,
-                    );
+                    builder.push_div(markdown_rule_div(&self.style), range, markdown_end);
                     builder.pop_div()
                 }
                 MarkdownEvent::SoftBreak => builder.push_text(" ", range.clone()),
@@ -3597,6 +3780,34 @@ mod tests {
 
         assert_eq!(first_word, "a");
         assert_eq!(second_word, "b");
+    }
+
+    #[gpui::test]
+    fn test_shared_block_helpers_render_outside_markdown_element(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        struct TestWindow;
+
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.draw(
+            Default::default(),
+            size(px(600.0), px(300.0)),
+            |window, cx| {
+                let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+                div()
+                    .child(markdown_heading_div_for_level(&style, 2, None).child("Heading"))
+                    .child(markdown_paragraph_div(&style, None).child("Paragraph"))
+                    .child(markdown_rule_div(&style))
+            },
+        );
     }
 
     #[test]

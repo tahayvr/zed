@@ -3525,6 +3525,14 @@ impl EditorElement {
         }
 
         let relative = self.editor.read(cx).relative_line_numbers(cx);
+        let markdown_live_preview_block_ids = {
+            let editor = self.editor.read(cx);
+            if editor.markdown_live_preview.is_some() {
+                crate::markdown_live_preview::block_ids(&editor)
+            } else {
+                Default::default()
+            }
+        };
 
         let relative_line_numbers_enabled = relative.enabled();
         let relative_rows = if relative_line_numbers_enabled
@@ -3546,6 +3554,21 @@ impl EditorElement {
             .enumerate()
             .flat_map(|(ix, row_info)| {
                 let display_row = DisplayRow(gutter.range.start.0 + ix as u32);
+                if !markdown_live_preview_block_ids.is_empty()
+                    && gutter
+                        .snapshot
+                        .display_snapshot
+                        .blocks_in_range(display_row..display_row.next_row())
+                        .any(|(_, block)| {
+                            if let Block::Custom(block) = block {
+                                markdown_live_preview_block_ids.contains(&block.id)
+                            } else {
+                                false
+                            }
+                        })
+                {
+                    return None;
+                }
                 line_number.clear();
                 let non_relative_number = if relative.wrapped() {
                     row_info.buffer_row.or(row_info.wrapped_buffer_row)? + 1

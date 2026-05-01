@@ -7,14 +7,23 @@ use futures::FutureExt;
 use gpui::{
     App, Context, FontStyle, FontWeight, HighlightStyle, ImageSource, IntoElement, ParentElement,
     MouseButton, Refineable, StrikethroughStyle, Styled, StyledImage, StyledText, Task,
-    WeakEntity, Window, div, px,
+    TextStyle, WeakEntity, Window, div, px,
 };
 use gpui::prelude::InteractiveElement as _;
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use markdown::{
     MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM, MarkdownFont, MarkdownStyle,
-    apply_markdown_heading_style_for_level, markdown_blockquote_style, markdown_list_item_style,
-    markdown_paragraph_style, render_markdown_paragraph_lines,
+    MarkdownEvent, MarkdownTag, MarkdownTagEnd,
+    apply_markdown_heading_style_for_level, markdown_blockquote_style,
+    markdown_blockquote_border_color, markdown_code_block_content_div,
+    markdown_code_block_parent_div,
+    markdown_heading_div_for_level,
+    markdown_list_div, markdown_list_item_content_div, markdown_list_item_div,
+    markdown_blockquote_body, parse_markdown_blockquote_callout, parse_markdown_list_item_line,
+    parse_markdown_events, parse_markdown_list_items, parse_markdown_table_rows,
+    RenderedMarkdownListItem,
+    markdown_paragraph_div, markdown_rule_div, markdown_table_cell_div, markdown_table_div,
+    render_markdown_paragraph_lines,
 };
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
@@ -37,6 +46,7 @@ const IMAGE_ESTIMATED_LINE_HEIGHT_PX: f32 = 20.0;
 const PREVIEW_LIST_LINE_HEIGHT_REMS: f32 = 1.3;
 const HORIZONTAL_RULE_BLOCK_HEIGHT_LINES: u32 = 2;
 const ACTIVE_SOURCE_BACKGROUND_ALPHA: f32 = 0.35;
+const LIVE_PREVIEW_RIGHT_INSET_PX: f32 = 8.0;
 
 /// Type tag used to identify folds created by the markdown live preview feature.
 /// This allows selective removal without disturbing other fold types.
@@ -602,6 +612,14 @@ fn preview_block_height(line_count: usize, line_height: f32, vertical_padding: f
         .ceil() as u32
 }
 
+fn preview_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    MarkdownStyle::themed(preview_markdown_font(), window, cx)
+}
+
+fn preview_markdown_font() -> MarkdownFont {
+    MarkdownFont::Preview
+}
+
 fn heading_block_height(level: u8) -> u32 {
     match level {
         1 => 3,
@@ -681,17 +699,15 @@ fn render_image_block(
         if resolved_url.is_empty() {
             return gpui::Empty.into_any_element();
         }
-        // Use URI source for http(s) URLs; path source for everything else.
         let source: ImageSource = if resolved_url.contains("://") {
             ImageSource::from(resolved_url.to_string())
         } else {
             ImageSource::from(std::path::PathBuf::from(resolved_url.as_ref()))
         };
-        let max_width = cx.max_width;
         let mut container = div()
-            .ml(cx.anchor_x)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
-            .max_w(max_width)
             .h_full()
             .py_0p5();
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
@@ -729,25 +745,25 @@ fn render_code_block(
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
         let colors = cx.app.theme().colors();
-        let text_style = cx.editor_style.text.clone();
-        let mut code_block_style = markdown_style.code_block;
-        code_block_style.margin = Default::default();
-        let mut container = div()
-            .ml(cx.anchor_x)
+        let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
+        let mut container = markdown_code_block_parent_div(&markdown_style, colors.border_variant, false)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .rounded_lg()
-            .relative()
-            .font(cx.editor_style.text.font())
+            .font(text_style.font())
             .text_color(colors.text)
-            .line_height(cx.line_height)
+            .line_height(text_style.line_height)
             .overflow_x_hidden();
-        container.style().refine(&code_block_style);
+        container.style().margin = Default::default();
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
-            .children(code_lines(text.as_ref(), language.as_ref(), &text_style, cx.app))
+            .child(
+                markdown_code_block_content_div()
+                    .children(code_lines(text.as_ref(), language.as_ref(), &text_style, cx.app)),
+            )
             .into_any_element()
     })
 }
@@ -802,23 +818,16 @@ fn render_heading_block(
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
-        let mut element = div()
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let mut element = markdown_heading_div_for_level(&markdown_style, level, None)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .mt_4()
-            .mb_2()
             .child(text.as_ref().to_string());
         element.style().refine(&markdown_style.heading);
         attach_source_click_handler(&mut element, cursor_anchor, weak_editor.clone());
-
-        apply_markdown_heading_style_for_level(
-            element,
-            level,
-            markdown_style.heading_level_styles.as_ref(),
-        )
+        apply_markdown_heading_style_for_level(element, level, markdown_style.heading_level_styles.as_ref())
             .into_any_element()
     })
 }
@@ -830,14 +839,15 @@ fn render_paragraph_block(
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
-        let mut container = markdown_paragraph_style(false)
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let mut container = markdown_paragraph_div(&markdown_style, None)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .font(markdown_style.base_text_style.font())
-            .text_color(markdown_style.base_text_style.color);
+            .text_color(markdown_style.base_text_style.color)
+            .line_height(markdown_style.base_text_style.line_height);
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
             .children(render_markdown_paragraph_lines(text.as_ref(), &markdown_style))
@@ -852,28 +862,29 @@ fn render_blockquote_block(
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
-        let callout = parse_callout_header(text.as_ref());
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let callout = parse_markdown_blockquote_callout(text.as_ref());
         let border_color = callout
-            .map(|callout| callout.color(&markdown_style))
+            .map(|callout| markdown_blockquote_border_color(&markdown_style, Some(callout)))
             .unwrap_or(markdown_style.block_quote_border_color);
         let text_color = markdown_style
             .block_quote
             .color
             .unwrap_or_else(|| cx.app.theme().colors().text_muted);
         let mut container = markdown_blockquote_style(border_color)
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .font(cx.editor_style.text.font())
+            .font(markdown_style.base_text_style.font())
             .text_color(text_color)
-            .line_height(cx.line_height);
+            .line_height(markdown_style.base_text_style.line_height);
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
-        let body = blockquote_preview_body(text.as_ref(), callout);
         container
-            .when_some(callout, |this, callout| this.child(callout.render_header(border_color)))
-            .children(render_markdown_paragraph_lines(body, &markdown_style))
+            .children(render_markdown_paragraph_lines(
+                markdown_blockquote_body(text.as_ref(), callout),
+                &markdown_style,
+            ))
             .into_any_element()
     })
 }
@@ -883,17 +894,14 @@ fn render_horizontal_rule_block(
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
-        let mut container = div()
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let mut container = markdown_rule_div(&markdown_style)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
-            .h_full()
-            .my_2();
+            .h_full();
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
-        container
-            .child(div().w_full().border_t_1().border_color(markdown_style.rule_color))
-            .into_any_element()
+        container.into_any_element()
     })
 }
 
@@ -902,22 +910,18 @@ fn render_table_block(
     cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
-    let rows: Arc<[Vec<String>]> = parse_table_rows(&text).into();
-    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let colors = cx.app.theme().colors();
-        let mut container = div()
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
-            .w_full()
-            .h_full()
-            .overflow_hidden()
-            .rounded_sm()
-            .border(px(1.5))
-            .border_color(colors.border)
-            .mb_2()
-            .font(cx.editor_style.text.font())
-            .text_color(colors.text)
-            .line_height(cx.line_height);
+        let rows: Arc<[Vec<String>]> = parse_markdown_table_rows(&text).into();
+        Arc::new(move |cx: &mut crate::display_map::BlockContext| {
+            let colors = cx.app.theme().colors();
+            let markdown_style = preview_markdown_style(cx.window, cx.app);
+            let mut container = markdown_table_div(&markdown_style, rows.first().map_or(0, |row| row.len()) as u16, colors)
+                .pl(cx.anchor_x)
+                .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
+                .w_full()
+                .h_full()
+                .font(markdown_style.base_text_style.font())
+                .text_color(colors.text)
+                .line_height(markdown_style.base_text_style.line_height);
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
             .children(rows.iter().enumerate().map(|(row_index, row)| {
@@ -926,17 +930,10 @@ fn render_table_block(
                     .flex()
                     .w_full()
                     .min_h(cx.line_height)
-                    .when(is_header, |this| this.bg(colors.title_bar_background))
-                    .when(!is_header && row_index % 2 == 1, |this| this.bg(colors.panel_background))
-                    .when(row_index > 0, |this| {
-                        this.border_t_1().border_color(colors.border)
-                    })
-                    .children(row.iter().map(move |cell| {
-                        div()
+                    .children(row.iter().enumerate().map(move |(column_index, cell)| {
+                        markdown_table_cell_div(is_header, row_index, column_index, colors)
                             .flex_1()
                             .min_w_0()
-                            .px_1()
-                            .py_0p5()
                             .when(is_header, |this| this.font_weight(FontWeight::SEMIBOLD))
                             .child(cell.clone())
                     }))
@@ -953,25 +950,27 @@ fn render_html_block(
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
-        let text_style = cx.editor_style.text.clone();
-        let mut container = div()
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
+        let mut container = markdown_code_block_parent_div(&markdown_style, colors.border_variant, true)
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .px_2()
-            .py_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border_variant)
             .bg(colors.element_background)
-            .font(cx.editor_style.text.font())
+            .font(text_style.font())
             .text_color(colors.text_muted)
-            .line_height(cx.line_height)
+            .line_height(text_style.line_height)
             .overflow_hidden();
+        container.style().margin = Default::default();
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
-            .children(code_lines(text.as_ref(), None, &text_style, cx.app))
+            .child(
+                markdown_code_block_content_div()
+                    .px_2()
+                    .py_1()
+                    .children(code_lines(text.as_ref(), None, &text_style, cx.app)),
+            )
             .into_any_element()
     })
 }
@@ -981,19 +980,19 @@ fn render_list_block(
     cursor_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
-    let items: Arc<[RenderedListItem]> = parse_list_items(&text).into();
+    let items: Arc<[RenderedMarkdownListItem]> = parse_markdown_list_items(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
-        let mut container = div()
-            .ml(cx.anchor_x)
-            .max_w(cx.max_width)
+        let markdown_style = preview_markdown_style(cx.window, cx.app);
+        let mut container = markdown_list_div()
+            .pl(cx.anchor_x)
+            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .pl_2p5()
-            .font(cx.editor_style.text.font())
-            .text_color(colors.text)
-            .line_height(cx.line_height * (MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM / 1.75));
+            .font(markdown_style.base_text_style.font())
+            .text_color(markdown_style.base_text_style.color)
+            .line_height(gpui::rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM));
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
             .children(items.iter().map(|item| {
@@ -1004,27 +1003,32 @@ fn render_list_block(
 }
 
 fn render_list_item(
-    item: &RenderedListItem,
+    item: &RenderedMarkdownListItem,
     marker_color: gpui::Hsla,
     markdown_style: &MarkdownStyle,
 ) -> gpui::AnyElement {
-    markdown_list_item_style(false)
+    markdown_list_item_div(
+        markdown_style,
+        div()
+            .w(px(16.0))
+            .flex_none()
+            .text_color(marker_color)
+            .child(item.marker.clone())
+            .into_any_element(),
+    )
         .mb_1()
         .pl(px(item.indent_columns as f32 * 12.0))
         .child(
-            div()
-                .w(px(16.0))
-                .flex_none()
-                .text_color(marker_color)
-                .child(item.marker.clone()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .w_0()
+            markdown_list_item_content_div()
                 .children(render_markdown_paragraph_lines(&item.text, markdown_style)),
         )
         .into_any_element()
+}
+
+fn preview_code_text_style(markdown_style: &MarkdownStyle, fallback_text_style: TextStyle) -> TextStyle {
+    let mut text_style = fallback_text_style;
+    text_style.refine(&markdown_style.code_block.text);
+    text_style
 }
 
 fn attach_source_click_handler(
@@ -1044,153 +1048,6 @@ fn attach_source_click_handler(
         });
 }
 
-fn parse_table_rows(text: &str) -> Vec<Vec<String>> {
-    text.lines()
-        .filter(|line| !is_table_delimiter_row(line))
-        .map(|line| {
-            line.trim()
-                .trim_matches('|')
-                .split('|')
-                .map(|cell| cell.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|row| !row.is_empty())
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RenderedListItem {
-    indent_columns: usize,
-    marker: String,
-    text: String,
-}
-
-fn parse_list_items(text: &str) -> Vec<RenderedListItem> {
-    text.lines()
-        .filter_map(parse_list_item_line)
-        .collect()
-}
-
-fn parse_list_item_line(line: &str) -> Option<RenderedListItem> {
-    let indent_columns = line.chars().take_while(|char| char.is_whitespace()).count();
-    let trimmed = line.trim_start();
-    let (marker, remaining) = parse_list_marker(trimmed)?;
-    let remaining = remaining.trim_start();
-    let (marker, text) = if let Some(text) = remaining.strip_prefix("[ ]") {
-        ("[ ]".to_string(), text.trim_start().to_string())
-    } else if remaining
-        .get(..3)
-        .is_some_and(|prefix| matches!(prefix, "[x]" | "[X]"))
-    {
-        ("[x]".to_string(), remaining[3..].trim_start().to_string())
-    } else {
-        (marker, remaining.to_string())
-    };
-
-    Some(RenderedListItem {
-        indent_columns,
-        marker,
-        text,
-    })
-}
-
-fn parse_list_marker(text: &str) -> Option<(String, &str)> {
-    let first = text.chars().next()?;
-    if matches!(first, '-' | '+' | '*') {
-        return text
-            .get(first.len_utf8()..)
-            .and_then(|remaining| remaining.starts_with(char::is_whitespace).then(|| ("•".to_string(), remaining)));
-    }
-
-    let marker_end = text
-        .char_indices()
-        .find_map(|(index, char)| matches!(char, '.' | ')').then_some((index, char)))?;
-    let number = &text[..marker_end.0];
-    if number.is_empty() || !number.chars().all(|char| char.is_ascii_digit()) {
-        return None;
-    }
-    let remaining = &text[marker_end.0 + marker_end.1.len_utf8()..];
-    remaining
-        .starts_with(char::is_whitespace)
-        .then(|| (format!("{}.", number), remaining))
-}
-
-fn is_table_delimiter_row(line: &str) -> bool {
-    let trimmed = line.trim().trim_matches('|').trim();
-    !trimmed.is_empty()
-        && trimmed
-            .split('|')
-            .all(|cell| cell.trim().chars().all(|char| matches!(char, '-' | ':')))
-}
-
-fn blockquote_preview_body(text: &str, callout: Option<LivePreviewCalloutKind>) -> &str {
-    if callout.is_none() {
-        return text;
-    }
-
-    text.lines()
-        .next()
-        .and_then(|first_line| text.strip_prefix(first_line))
-        .map(|remaining| remaining.strip_prefix('\n').unwrap_or(remaining))
-        .unwrap_or(text)
-}
-
-#[derive(Clone, Copy)]
-enum LivePreviewCalloutKind {
-    Note,
-    Tip,
-    Important,
-    Warning,
-    Caution,
-}
-
-impl LivePreviewCalloutKind {
-    fn color(self, markdown_style: &MarkdownStyle) -> gpui::Hsla {
-        match self {
-            Self::Note => markdown_style.block_quote_kind_colors.note,
-            Self::Tip => markdown_style.block_quote_kind_colors.tip,
-            Self::Important => markdown_style.block_quote_kind_colors.important,
-            Self::Warning => markdown_style.block_quote_kind_colors.warning,
-            Self::Caution => markdown_style.block_quote_kind_colors.caution,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Note => "Note",
-            Self::Tip => "Tip",
-            Self::Important => "Important",
-            Self::Warning => "Warning",
-            Self::Caution => "Caution",
-        }
-    }
-
-    fn render_header(self, color: gpui::Hsla) -> gpui::AnyElement {
-        div()
-            .mb_1()
-            .font_weight(FontWeight::BOLD)
-            .text_color(color)
-            .child(self.label())
-            .into_any_element()
-    }
-}
-
-fn parse_callout_header(text: &str) -> Option<LivePreviewCalloutKind> {
-    let first_line = text.lines().next()?.trim_start();
-    let label = first_line
-        .strip_prefix("[!")?
-        .split_once(']')?
-        .0
-        .to_ascii_lowercase();
-    match label.as_str() {
-        "note" => Some(LivePreviewCalloutKind::Note),
-        "tip" => Some(LivePreviewCalloutKind::Tip),
-        "important" => Some(LivePreviewCalloutKind::Important),
-        "warning" => Some(LivePreviewCalloutKind::Warning),
-        "caution" => Some(LivePreviewCalloutKind::Caution),
-        _ => None,
-    }
-}
 
 /// Returns the highlight style to apply to the content of a markdown node.
 fn highlight_style_for_kind(kind: MarkdownNodeKind, cx: &App) -> Option<HighlightStyle> {
@@ -1403,7 +1260,8 @@ fn text_list_ranges(
         let inside_fenced_code = fenced_code_ranges
             .iter()
             .any(|range| line_start >= range.start && line_start < range.end);
-        let is_list_line = !inside_fenced_code && parse_list_item_line(line_without_newline).is_some();
+        let is_list_line = !inside_fenced_code
+            && parse_markdown_list_item_line(line_without_newline).is_some();
 
         if is_list_line {
             if block_start.is_none() {
@@ -1580,7 +1438,9 @@ fn visit_block_nodes(
                 continue;
             }
             "paragraph" => {
-                if let Some(decorator) = parse_paragraph(node, snapshot, multi_snapshot) {
+                if let Some(decorator) = parse_image_paragraph(node, snapshot, multi_snapshot) {
+                    nodes.push(decorator);
+                } else if let Some(decorator) = parse_paragraph(node, snapshot, multi_snapshot) {
                     nodes.push(decorator);
                 }
             }
@@ -1642,6 +1502,86 @@ fn parse_paragraph(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text),
+        cursor_anchor: Some(cursor_anchor),
+    })
+}
+
+fn parse_image_paragraph(
+    node: Node<'_>,
+    snapshot: &BufferSnapshot,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Option<MarkdownDecoratorNode> {
+    let source = snapshot
+        .chars_for_range(node.byte_range())
+        .collect::<String>();
+    let parsed = parse_markdown_events(&source);
+
+    let mut image_destination = None;
+    let mut alt_text = String::new();
+    let mut in_image = false;
+    let mut image_count: usize = 0;
+    let mut paragraph_depth: usize = 0;
+
+    for (range, event) in parsed.iter() {
+        match event {
+            MarkdownEvent::Start(MarkdownTag::Paragraph) => {
+                paragraph_depth += 1;
+            }
+            MarkdownEvent::End(MarkdownTagEnd::Paragraph) => {
+                paragraph_depth = paragraph_depth.saturating_sub(1);
+            }
+            MarkdownEvent::Start(MarkdownTag::Image { dest_url, .. }) => {
+                if paragraph_depth == 0 || image_destination.is_some() {
+                    return None;
+                }
+                image_destination = Some(dest_url.to_string());
+                image_count += 1;
+                in_image = true;
+            }
+            MarkdownEvent::End(MarkdownTagEnd::Image) => {
+                in_image = false;
+            }
+            MarkdownEvent::Text if in_image => {
+                alt_text.push_str(&source[range.clone()]);
+            }
+            MarkdownEvent::SubstitutedText(text) if in_image => {
+                alt_text.push_str(&text);
+            }
+            MarkdownEvent::Text => {
+                if !source[range.clone()].trim().is_empty() {
+                    return None;
+                }
+            }
+            MarkdownEvent::SubstitutedText(text) => {
+                if !text.trim().is_empty() {
+                    return None;
+                }
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak | MarkdownEvent::RootStart | MarkdownEvent::RootEnd(_) => {}
+            MarkdownEvent::Start(_) | MarkdownEvent::End(_) | MarkdownEvent::Code | MarkdownEvent::Html | MarkdownEvent::InlineHtml | MarkdownEvent::FootnoteReference(_) | MarkdownEvent::Rule | MarkdownEvent::TaskListMarker(_) => {
+                if !in_image {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if image_count != 1 || in_image || paragraph_depth != 0 {
+        return None;
+    }
+
+    let image_url = image_destination?;
+    let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+    let cursor_anchor = full_range.start;
+
+    Some(MarkdownDecoratorNode {
+        full_range: full_range.clone(),
+        decorator_ranges: vec![full_range],
+        kind: MarkdownNodeKind::Image,
+        background_range: None,
+        image_url: Some(image_url),
+        code_language: None,
+        preview_text: (!alt_text.trim().is_empty()).then_some(alt_text.trim().to_string()),
         cursor_anchor: Some(cursor_anchor),
     })
 }
@@ -2405,11 +2345,8 @@ mod tests {
 
     #[test]
     fn test_parse_callout_header() {
-        assert!(matches!(
-            parse_callout_header("[!warning]\nBe careful"),
-            Some(LivePreviewCalloutKind::Warning)
-        ));
-        assert!(parse_callout_header("regular quote").is_none());
+        assert!(parse_markdown_blockquote_callout("[!warning]\nBe careful").is_some());
+        assert!(parse_markdown_blockquote_callout("regular quote").is_none());
     }
 
     #[test]
@@ -2419,21 +2356,26 @@ mod tests {
     }
 
     #[test]
+    fn test_preview_markdown_style_uses_preview_font() {
+        assert!(matches!(preview_markdown_font(), MarkdownFont::Preview));
+    }
+
+    #[test]
     fn test_parse_list_items() {
         assert_eq!(
-            parse_list_items("- one\n  - [x] nested\n2. two"),
+            parse_markdown_list_items("- one\n  - [x] nested\n2. two"),
             vec![
-                RenderedListItem {
+                RenderedMarkdownListItem {
                     indent_columns: 0,
                     marker: "•".to_string(),
                     text: "one".to_string(),
                 },
-                RenderedListItem {
+                RenderedMarkdownListItem {
                     indent_columns: 2,
                     marker: "[x]".to_string(),
                     text: "nested".to_string(),
                 },
-                RenderedListItem {
+                RenderedMarkdownListItem {
                     indent_columns: 0,
                     marker: "2.".to_string(),
                     text: "two".to_string(),
@@ -2452,7 +2394,7 @@ mod tests {
     #[test]
     fn test_parse_table_rows_skips_delimiter_row() {
         assert_eq!(
-            parse_table_rows("| Name | Value |\n| --- | :---: |\n| A | 1 |"),
+            parse_markdown_table_rows("| Name | Value |\n| --- | :---: |\n| A | 1 |"),
             vec![
                 vec!["Name".to_string(), "Value".to_string()],
                 vec!["A".to_string(), "1".to_string()]
@@ -2462,7 +2404,7 @@ mod tests {
 
     #[test]
     fn test_table_delimiter_detection() {
-        assert!(is_table_delimiter_row("| --- | :---: | ---: |"));
-        assert!(!is_table_delimiter_row("| Name | Value |"));
+        assert!(markdown::is_markdown_table_delimiter_row("| --- | :---: | ---: |"));
+        assert!(!markdown::is_markdown_table_delimiter_row("| Name | Value |"));
     }
 }

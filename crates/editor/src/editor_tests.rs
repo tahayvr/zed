@@ -37663,6 +37663,84 @@ async fn test_markdown_live_preview_replaces_blockquote_when_cursor_away(
 }
 
 #[gpui::test]
+async fn test_markdown_live_preview_replaces_image_when_cursor_away(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {r#"
+        ![alt](test-image.png)
+
+        ˇSome other text
+    "#});
+    cx.run_until_parked();
+
+    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    assert!(block_count >= 1, "expected an image replacement block when cursor is away");
+}
+
+#[gpui::test]
+async fn test_markdown_live_preview_image_block_returns_after_cursor_leaves(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.markdown = Some(settings::MarkdownContent {
+            live_preview: Some(true),
+        });
+    });
+
+    let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    language_registry.add(markdown_lang());
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language_registry(language_registry);
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+
+    cx.set_state(indoc! {r#"
+        ![alt](test-image.png)
+
+        ˇSome other text
+    "#});
+    cx.run_until_parked();
+
+    let initial_block_count =
+        cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)]);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(24)..MultiBufferOffset(24)]);
+        });
+    });
+    cx.run_until_parked();
+
+    let final_block_count =
+        cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+
+    assert!(initial_block_count >= 1, "expected image replacement block initially");
+    assert!(final_block_count >= 1, "expected image replacement block after cursor leaves image");
+}
+
+#[gpui::test]
 async fn test_markdown_live_preview_replaces_horizontal_rule_when_cursor_away(
     cx: &mut TestAppContext,
 ) {
