@@ -25,6 +25,7 @@ use markdown::{
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
 use theme::ActiveTheme;
+use text::Point;
 use ui::{CopyButton, FluentBuilder, VisibleOnHover};
 
 use crate::Editor;
@@ -421,13 +422,15 @@ fn apply_blocks(
             continue;
         }
 
+        let replacement_end = replacement_end_anchor(node, multi_snapshot);
+
         match node.kind {
             MarkdownNodeKind::Heading(level) => {
                 let Some(text) = node.preview_text.clone() else {
                     continue;
                 };
                 new_blocks.push(BlockProperties {
-                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    placement: BlockPlacement::Replace(node.full_range.start..=replacement_end),
                     height: Some(heading_block_height(level)),
                     style: BlockStyle::Flex,
                     render: render_heading_block(
@@ -443,13 +446,9 @@ fn apply_blocks(
                 let Some(text) = node.preview_text.clone() else {
                     continue;
                 };
-                let height = preview_block_height(
-                    text.lines().count(),
-                    14.0 * MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM,
-                    12.0,
-                );
+                let height = text.lines().count().max(1) as u32;
                 new_blocks.push(BlockProperties {
-                    placement: BlockPlacement::Replace(node.full_range.start..=node.full_range.end),
+                    placement: BlockPlacement::Replace(node.full_range.start..=replacement_end),
                     height: Some(height),
                     style: BlockStyle::Flex,
                     render: render_paragraph_block(
@@ -622,6 +621,28 @@ fn apply_blocks(
 fn preview_block_height(line_count: usize, line_height: f32, vertical_padding: f32) -> u32 {
     ((line_count.max(1) as f32 * line_height + vertical_padding) / IMAGE_ESTIMATED_LINE_HEIGHT_PX)
         .ceil() as u32
+}
+
+fn replacement_end_anchor(
+    node: &MarkdownDecoratorNode,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Anchor {
+    match node.kind {
+        MarkdownNodeKind::Heading(_) | MarkdownNodeKind::Paragraph => {
+            let end_offset = node.full_range.end.to_offset(multi_snapshot).0;
+            let end_point = multi_snapshot.offset_to_point(MultiBufferOffset(end_offset));
+            let next_row = end_point.row + 1;
+
+            if next_row <= multi_snapshot.max_point().row
+                && multi_snapshot.is_line_blank(multi_buffer::MultiBufferRow(next_row))
+            {
+                return multi_snapshot.anchor_after(Point::new(next_row, 0));
+            }
+
+            node.full_range.end
+        }
+        _ => node.full_range.end,
+    }
 }
 
 fn preview_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
@@ -873,6 +894,7 @@ fn render_heading_block(
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
+            .text_size(markdown_style.base_text_style.font_size)
             .child(text.as_ref().to_string());
         element.style().refine(&markdown_style.heading);
         attach_source_click_handler(&mut element, cursor_anchor, weak_editor.clone());
@@ -899,8 +921,10 @@ fn render_paragraph_block(
             .w_full()
             .h_full()
             .font(markdown_style.base_text_style.font())
+            .text_size(markdown_style.base_text_style.font_size)
             .text_color(markdown_style.base_text_style.color)
             .line_height(markdown_style.base_text_style.line_height);
+        container.style().margin = Default::default();
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
         container
             .children(render_markdown_paragraph_lines(
@@ -933,6 +957,7 @@ fn render_blockquote_block(
             .w_full()
             .h_full()
             .font(markdown_style.base_text_style.font())
+            .text_size(markdown_style.base_text_style.font_size)
             .text_color(text_color)
             .line_height(markdown_style.base_text_style.line_height);
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
@@ -982,6 +1007,7 @@ fn render_table_block(
         .w_full()
         .h_full()
         .font(markdown_style.base_text_style.font())
+        .text_size(markdown_style.base_text_style.font_size)
         .text_color(colors.text)
         .line_height(markdown_style.base_text_style.line_height);
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
@@ -1054,6 +1080,7 @@ fn render_list_block(
             .h_full()
             .pl_2p5()
             .font(markdown_style.base_text_style.font())
+            .text_size(markdown_style.base_text_style.font_size)
             .text_color(markdown_style.base_text_style.color)
             .line_height(gpui::rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM));
         attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
