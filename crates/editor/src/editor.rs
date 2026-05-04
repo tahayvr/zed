@@ -26700,6 +26700,10 @@ impl Editor {
             text_style.refine(text_style_refinement)
         }
 
+        if self.markdown_live_preview.is_some() {
+            text_style.font_family = settings.markdown_preview_font_family().clone();
+        }
+
         let background = match self.mode {
             EditorMode::SingleLine => cx.theme().system().transparent,
             EditorMode::AutoHeight { .. } => cx.theme().system().transparent,

@@ -1,6 +1,7 @@
 use std::any::TypeId;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use collections::HashSet;
 use futures::FutureExt;
@@ -8,7 +9,7 @@ use gpui::prelude::InteractiveElement as _;
 use gpui::{
     App, Context, ElementId, FontStyle, FontWeight, HighlightStyle, ImageSource, IntoElement,
     MouseButton, ParentElement, Refineable, StrikethroughStyle, Styled, StyledImage, StyledText,
-    Task, TextStyle, WeakEntity, Window, div, px,
+    Task, TextStyle, WeakEntity, Window, canvas, div, px,
 };
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use markdown::{
@@ -91,8 +92,6 @@ pub struct MarkdownDecoratorNode {
     pub code_language: Option<String>,
     /// Rendered preview text for block-level markdown nodes.
     pub preview_text: Option<String>,
-    /// Preferred cursor target when clicking a replacement preview block.
-    pub cursor_anchor: Option<Anchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +122,41 @@ impl MarkdownLivePreview {
             _refresh_task: None,
         }
     }
+}
+
+/// Shared click-targeting state for a block preview.
+/// The canvas child of each block writes its bounds and line-height here
+/// each frame; the `on_mouse_down` handler reads them to compute the
+/// correct source line to navigate to.
+struct BlockClickState {
+    top_y: AtomicU32,
+    line_height: AtomicU32,
+}
+
+impl BlockClickState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            top_y: AtomicU32::new(0),
+            line_height: AtomicU32::new(0),
+        })
+    }
+}
+
+/// Returns one anchor per source line covered by `node.full_range`.
+/// Used to map a clicked rendered line back to the originating source line.
+fn node_line_anchors(
+    node: &MarkdownDecoratorNode,
+    multi_snapshot: &MultiBufferSnapshot,
+) -> Arc<[Anchor]> {
+    let start_offset = node.full_range.start.to_offset(multi_snapshot).0;
+    let end_offset = node.full_range.end.to_offset(multi_snapshot).0;
+    let start_point = multi_snapshot.offset_to_point(MultiBufferOffset(start_offset));
+    let end_point = multi_snapshot.offset_to_point(MultiBufferOffset(end_offset));
+    let start_row = start_point.row;
+    let end_row = end_point.row;
+    (start_row..=end_row)
+        .map(|row| multi_snapshot.anchor_before(Point::new(row, 0)))
+        .collect()
 }
 
 /// Returns true if the editor should activate live preview for its current buffer.
@@ -423,6 +457,8 @@ fn apply_blocks(
         }
 
         let replacement_end = replacement_end_anchor(node, multi_snapshot);
+        let line_anchors = node_line_anchors(node, multi_snapshot);
+        let click_state = BlockClickState::new();
 
         match node.kind {
             MarkdownNodeKind::Heading(level) => {
@@ -436,7 +472,8 @@ fn apply_blocks(
                     render: render_heading_block(
                         text,
                         level,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -453,7 +490,8 @@ fn apply_blocks(
                     style: BlockStyle::Flex,
                     render: render_paragraph_block(
                         text,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -473,7 +511,8 @@ fn apply_blocks(
                 let render = render_image_block(
                     resolved_url,
                     image_metadata,
-                    node.cursor_anchor.unwrap_or(node.full_range.start),
+                    line_anchors,
+                    click_state,
                     weak_editor.clone(),
                 );
                 new_blocks.push(BlockProperties {
@@ -516,7 +555,8 @@ fn apply_blocks(
                     render: render_code_block(
                         text,
                         language,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -533,7 +573,8 @@ fn apply_blocks(
                     style: BlockStyle::Flex,
                     render: render_blockquote_block(
                         text,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -545,7 +586,8 @@ fn apply_blocks(
                     height: Some(HORIZONTAL_RULE_BLOCK_HEIGHT_LINES),
                     style: BlockStyle::Flex,
                     render: render_horizontal_rule_block(
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -562,7 +604,8 @@ fn apply_blocks(
                     style: BlockStyle::Flex,
                     render: render_table_block(
                         text,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -579,7 +622,8 @@ fn apply_blocks(
                     style: BlockStyle::Flex,
                     render: render_html_block(
                         text,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -600,7 +644,8 @@ fn apply_blocks(
                     style: BlockStyle::Flex,
                     render: render_list_block(
                         text,
-                        node.cursor_anchor.unwrap_or(node.full_range.start),
+                        line_anchors,
+                        click_state,
                         weak_editor.clone(),
                     ),
                     priority: 0,
@@ -726,7 +771,8 @@ fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
 fn render_image_block(
     resolved_url: String,
     metadata: ImageBlockMetadata,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let resolved_url: Arc<str> = resolved_url.into();
@@ -739,13 +785,20 @@ fn render_image_block(
         } else {
             ImageSource::from(std::path::PathBuf::from(resolved_url.as_ref()))
         };
-        let mut container = div()
+        let line_height = cx.line_height;
+        let container = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .py_0p5();
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         if !metadata.loaded_local_dimensions && !resolved_url.contains("://") {
             let colors = cx.app.theme().colors();
             return container
@@ -780,7 +833,8 @@ fn render_image_block(
 fn render_code_block(
     text: String,
     language: Option<Arc<Language>>,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
@@ -788,14 +842,21 @@ fn render_code_block(
         let markdown_style = preview_markdown_style(cx.window, cx.app);
         let colors = cx.app.theme().colors();
         let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
-        let mut outer = div()
+        let line_height = cx.line_height;
+        let outer = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .bg(colors.editor_background)
             .overflow_hidden();
-        attach_source_click_handler(&mut outer, cursor_anchor, weak_editor.clone());
+        let outer = attach_source_click_handler(
+            outer,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
 
         outer
             .child(
@@ -883,21 +944,30 @@ fn syntax_highlights_for_line(
 fn render_heading_block(
     text: String,
     level: u8,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let mut element = markdown_heading_div_for_level(&markdown_style, level, None)
+        let line_height = cx.line_height;
+        let element = markdown_heading_div_for_level(&markdown_style, level, None)
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .text_size(markdown_style.base_text_style.font_size)
             .child(text.as_ref().to_string());
+        let mut element = element;
         element.style().refine(&markdown_style.heading);
-        attach_source_click_handler(&mut element, cursor_anchor, weak_editor.clone());
+        let element = attach_source_click_handler(
+            element,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         apply_markdown_heading_style_for_level(
             element,
             level,
@@ -909,23 +979,31 @@ fn render_heading_block(
 
 fn render_paragraph_block(
     text: String,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let mut container = markdown_paragraph_div(&markdown_style, None)
+        let line_height = cx.line_height;
+        let container = markdown_paragraph_div(&markdown_style, None)
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .font(markdown_style.base_text_style.font())
             .text_size(markdown_style.base_text_style.font_size)
             .text_color(markdown_style.base_text_style.color)
             .line_height(markdown_style.base_text_style.line_height);
+        let mut container = container;
         container.style().margin = Default::default();
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .children(render_markdown_paragraph_lines(
                 text.as_ref(),
@@ -937,7 +1015,8 @@ fn render_paragraph_block(
 
 fn render_blockquote_block(
     text: String,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
@@ -951,16 +1030,22 @@ fn render_blockquote_block(
             .block_quote
             .color
             .unwrap_or_else(|| cx.app.theme().colors().text_muted);
-        let mut container = markdown_blockquote_style(border_color)
+        let line_height = cx.line_height;
+        let container = markdown_blockquote_style(border_color)
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
-            .font(markdown_style.base_text_style.font())
             .text_size(markdown_style.base_text_style.font_size)
             .text_color(text_color)
             .line_height(markdown_style.base_text_style.line_height);
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .children(render_markdown_paragraph_lines(
                 markdown_blockquote_body(text.as_ref(), callout),
@@ -971,17 +1056,25 @@ fn render_blockquote_block(
 }
 
 fn render_horizontal_rule_block(
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let mut container = div()
+        let line_height = cx.line_height;
+        let container = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .child(markdown_rule_div(&markdown_style).w_full())
             .into_any_element()
@@ -990,14 +1083,16 @@ fn render_horizontal_rule_block(
 
 fn render_table_block(
     text: String,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let rows: Arc<[Vec<String>]> = parse_markdown_table_rows(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let mut container = markdown_table_div(
+        let line_height = cx.line_height;
+        let container = markdown_table_div(
             &markdown_style,
             rows.first().map_or(0, |row| row.len()) as u16,
             colors,
@@ -1006,11 +1101,16 @@ fn render_table_block(
         .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
         .w_full()
         .h_full()
-        .font(markdown_style.base_text_style.font())
         .text_size(markdown_style.base_text_style.font_size)
         .text_color(colors.text)
         .line_height(markdown_style.base_text_style.line_height);
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .children(rows.iter().enumerate().map(|(row_index, row)| {
                 let is_header = row_index == 0;
@@ -1032,7 +1132,8 @@ fn render_table_block(
 
 fn render_html_block(
     text: String,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
@@ -1040,7 +1141,8 @@ fn render_html_block(
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
         let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
-        let mut container =
+        let line_height = cx.line_height;
+        let container =
             markdown_code_block_parent_div(&markdown_style, colors.border_variant, true)
                 .pl(cx.anchor_x)
                 .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
@@ -1051,8 +1153,15 @@ fn render_html_block(
                 .text_color(colors.text_muted)
                 .line_height(text_style.line_height)
                 .overflow_hidden();
+        let mut container = container;
         container.style().margin = Default::default();
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .child(
                 markdown_code_block_content_div()
@@ -1066,24 +1175,31 @@ fn render_html_block(
 
 fn render_list_block(
     text: String,
-    cursor_anchor: Anchor,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let items: Arc<[RenderedMarkdownListItem]> = parse_markdown_list_items(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let mut container = markdown_list_div()
+        let line_height = cx.line_height;
+        let container = markdown_list_div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .pl_2p5()
-            .font(markdown_style.base_text_style.font())
             .text_size(markdown_style.base_text_style.font_size)
             .text_color(markdown_style.base_text_style.color)
             .line_height(gpui::rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM));
-        attach_source_click_handler(&mut container, cursor_anchor, weak_editor.clone());
+        let container = attach_source_click_handler(
+            container,
+            line_anchors.clone(),
+            click_state.clone(),
+            line_height,
+            weak_editor.clone(),
+        );
         container
             .children(
                 items
@@ -1127,20 +1243,50 @@ fn preview_code_text_style(
 }
 
 fn attach_source_click_handler(
-    element: &mut gpui::Div,
-    cursor_anchor: Anchor,
+    element: gpui::Div,
+    line_anchors: Arc<[Anchor]>,
+    click_state: Arc<BlockClickState>,
+    line_height: gpui::Pixels,
     weak_editor: WeakEntity<Editor>,
-) {
+) -> gpui::Div {
+    let click_state_canvas = click_state.clone();
+    let click_state_handler = click_state;
     element
-        .interactivity()
-        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+        .child(
+            canvas(
+                move |bounds, _, _| {
+                    click_state_canvas
+                        .top_y
+                        .store(bounds.origin.y.as_f32().to_bits(), Ordering::Relaxed);
+                    click_state_canvas
+                        .line_height
+                        .store(line_height.as_f32().to_bits(), Ordering::Relaxed);
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
             cx.stop_propagation();
+            if line_anchors.is_empty() {
+                return;
+            }
+            let top_y = f32::from_bits(click_state_handler.top_y.load(Ordering::Relaxed));
+            let lh = f32::from_bits(click_state_handler.line_height.load(Ordering::Relaxed));
+            let line_index = if lh > 0.0 {
+                let y_offset = (event.position.y.as_f32() - top_y).max(0.0);
+                ((y_offset / lh).floor() as usize).min(line_anchors.len() - 1)
+            } else {
+                0
+            };
+            let target_anchor = line_anchors[line_index];
             let _ = weak_editor.update(cx, |editor, cx| {
                 editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_ranges([cursor_anchor..cursor_anchor]);
+                    selections.select_ranges([target_anchor..target_anchor]);
                 });
             });
-        });
+        })
 }
 
 /// Returns the highlight style to apply to the content of a markdown node.
@@ -1319,7 +1465,6 @@ fn collect_text_list_nodes(
 
     for (range, text) in text_list_ranges(&text, &fenced_code_ranges, &existing_list_ranges) {
         let full_range = byte_range_to_anchor_range(range, multi_snapshot);
-        let cursor_anchor = full_range.start;
         nodes.push(MarkdownDecoratorNode {
             full_range: full_range.clone(),
             decorator_ranges: vec![full_range],
@@ -1328,7 +1473,6 @@ fn collect_text_list_nodes(
             image_url: None,
             code_language: None,
             preview_text: Some(text),
-            cursor_anchor: Some(cursor_anchor),
         });
     }
 }
@@ -1558,7 +1702,6 @@ fn parse_plain_replacement_block(
     preview_text: Option<String>,
 ) -> MarkdownDecoratorNode {
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
     MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
@@ -1567,7 +1710,6 @@ fn parse_plain_replacement_block(
         image_url: None,
         code_language: None,
         preview_text,
-        cursor_anchor: Some(cursor_anchor),
     }
 }
 
@@ -1586,7 +1728,6 @@ fn parse_paragraph(
     }
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
@@ -1595,7 +1736,6 @@ fn parse_paragraph(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text),
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1675,7 +1815,6 @@ fn parse_image_paragraph(
 
     let image_url = image_destination?;
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
@@ -1685,7 +1824,6 @@ fn parse_image_paragraph(
         image_url: Some(image_url),
         code_language: None,
         preview_text: (!alt_text.trim().is_empty()).then_some(alt_text.trim().to_string()),
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1815,7 +1953,6 @@ fn parse_atx_heading(
     let marker_start = marker_range.start.to_offset(multi_snapshot).0;
     let marker_end = marker_range.end.to_offset(multi_snapshot).0;
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = multi_snapshot.anchor_after(MultiBufferOffset(marker_end));
     let mut preview_text = snapshot
         .chars_for_range(node.byte_range())
         .collect::<String>();
@@ -1833,7 +1970,6 @@ fn parse_atx_heading(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text.trim().to_string()),
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1871,20 +2007,14 @@ fn parse_setext_heading(
     let underline_range = underline_range?;
     let node_range = node.byte_range();
     let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
-    let fallback_cursor_anchor = multi_snapshot.anchor_before(MultiBufferOffset(node_range.start));
     let mut preview_text = snapshot
         .chars_for_range(node_range.start..underline_range.start)
         .collect::<String>();
-    let text_start = node_range.start
+    let _text_start = node_range.start
         + preview_text
             .len()
             .saturating_sub(preview_text.trim_start().len());
     preview_text = preview_text.trim().to_string();
-    let cursor_anchor = if preview_text.is_empty() {
-        fallback_cursor_anchor
-    } else {
-        multi_snapshot.anchor_after(MultiBufferOffset(text_start))
-    };
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -1894,7 +2024,6 @@ fn parse_setext_heading(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text),
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1905,7 +2034,6 @@ fn parse_task_list_marker(
 ) -> Option<MarkdownDecoratorNode> {
     let checked = node.kind() == "task_list_marker_checked";
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
@@ -1914,7 +2042,6 @@ fn parse_task_list_marker(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -1993,7 +2120,6 @@ fn parse_fenced_code_block(
     }
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2003,7 +2129,6 @@ fn parse_fenced_code_block(
         image_url: None,
         code_language,
         preview_text,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2058,7 +2183,6 @@ fn parse_blockquote(
 
     let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
     let background_range = Some(byte_range_to_anchor_range(node_range, multi_snapshot));
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2068,7 +2192,6 @@ fn parse_blockquote(
         image_url: None,
         code_language: None,
         preview_text: Some(preview_text),
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2131,7 +2254,6 @@ fn parse_emphasis_node(
     };
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2141,7 +2263,6 @@ fn parse_emphasis_node(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2173,7 +2294,6 @@ fn parse_strikethrough_node(
     }
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: delimiter_ranges,
@@ -2182,7 +2302,6 @@ fn parse_strikethrough_node(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2214,7 +2333,6 @@ fn parse_code_span(
     }
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2224,7 +2342,6 @@ fn parse_code_span(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2238,7 +2355,6 @@ fn parse_autolink(
     }
 
     let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
-    let cursor_anchor = full_range.start;
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: vec![
@@ -2250,7 +2366,6 @@ fn parse_autolink(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2286,7 +2401,6 @@ fn parse_inline_link(
     let tail = byte_range_to_anchor_range(link_text_range.end..node_range.end, multi_snapshot);
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2296,7 +2410,6 @@ fn parse_inline_link(
         image_url: None,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
@@ -2359,7 +2472,6 @@ fn parse_image(
         };
 
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
-    let cursor_anchor = full_range.start;
 
     Some(MarkdownDecoratorNode {
         full_range,
@@ -2369,7 +2481,6 @@ fn parse_image(
         image_url,
         code_language: None,
         preview_text: None,
-        cursor_anchor: Some(cursor_anchor),
     })
 }
 
