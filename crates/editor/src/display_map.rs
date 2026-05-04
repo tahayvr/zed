@@ -1830,7 +1830,9 @@ impl DisplaySnapshot {
                             color
                         }
                     }),
-                    underline: chunk_highlight.underline,
+                    underline: chunk_highlight
+                        .underline
+                        .filter(|_| editor_style.show_underlines || editor_style.markdown_live_preview_active),
                     ..chunk_highlight
                 }
             });
