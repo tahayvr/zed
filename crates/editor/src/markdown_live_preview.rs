@@ -331,6 +331,12 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 new_cursor_inside.insert(node_index);
             }
 
+            // Checkbox markers are always covered by a parent List block replacement;
+            // folding them independently causes `[ ]`/`[x]` to disappear in source mode.
+            if matches!(node.data, MarkdownNodeData::Checkbox) {
+                continue;
+            }
+
             if node.decorator_ranges.is_empty() {
                 continue;
             }
@@ -1144,12 +1150,40 @@ fn render_html_block(
     })
 }
 
+/// For each parsed list item, returns the byte offset of its `[ ]`/`[x]` marker
+/// within the full list text, along with the current checked state.
+/// Returns `None` for non-checkbox items.
+fn checkbox_marker_offsets(text: &str) -> Vec<Option<(usize, bool)>> {
+    use markdown::parse_markdown_list_item_line;
+    let mut result = Vec::new();
+    let mut byte_offset = 0usize;
+    for line in text.split('\n') {
+        if let Some(item) = parse_markdown_list_item_line(line) {
+            let marker_offset = match item.marker.as_str() {
+                "[ ]" => line
+                    .find("[ ]")
+                    .map(|pos| (byte_offset + pos, false)),
+                "[x]" => line
+                    .find("[x]")
+                    .or_else(|| line.find("[X]"))
+                    .map(|pos| (byte_offset + pos, true)),
+                _ => None,
+            };
+            result.push(marker_offset);
+        }
+        byte_offset += line.len() + 1; // +1 for '\n'
+    }
+    result
+}
+
 fn render_list_block(
     text: String,
     start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let items: Arc<[RenderedMarkdownListItem]> = parse_markdown_list_items(&text).into();
+    let marker_offsets: Arc<[Option<(usize, bool)>]> =
+        checkbox_marker_offsets(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
@@ -1166,7 +1200,17 @@ fn render_list_block(
             .children(
                 items
                     .iter()
-                    .map(|item| render_list_item(item, colors.text, &markdown_style)),
+                    .zip(marker_offsets.iter())
+                    .map(|(item, marker_offset)| {
+                        render_list_item(
+                            item,
+                            *marker_offset,
+                            start_anchor,
+                            weak_editor.clone(),
+                            colors.text,
+                            &markdown_style,
+                        )
+                    }),
             )
             .into_any_element()
     })
@@ -1174,32 +1218,51 @@ fn render_list_block(
 
 fn render_list_item(
     item: &RenderedMarkdownListItem,
+    marker_offset: Option<(usize, bool)>,
+    start_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
     marker_color: gpui::Hsla,
     markdown_style: &MarkdownStyle,
 ) -> gpui::AnyElement {
     let marker_element = match item.marker.as_str() {
-        "[ ]" => div()
-            .w(px(16.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .child(
-                Checkbox::new("unchecked", ToggleState::Unselected)
-                    .fill()
-                    .visualization_only(true),
+        "[ ]" | "[x]" => {
+            let checked = item.marker == "[x]";
+            let toggle_state = if checked {
+                ToggleState::Selected
+            } else {
+                ToggleState::Unselected
+            };
+            let mut checkbox = Checkbox::new(
+                if checked { "checked" } else { "unchecked" },
+                toggle_state,
             )
-            .into_any_element(),
-        "[x]" => div()
-            .w(px(16.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .child(
-                Checkbox::new("checked", ToggleState::Selected)
-                    .fill()
-                    .visualization_only(true),
-            )
-            .into_any_element(),
+            .fill();
+            if let Some((offset, was_checked)) = marker_offset {
+                checkbox = checkbox.on_click(move |_state, _window, cx| {
+                    weak_editor
+                        .update(cx, |editor, cx| {
+                            let snapshot = editor.buffer().read(cx).snapshot(cx);
+                            let start_off = start_anchor.to_offset(&snapshot).0;
+                            let abs_off = start_off + offset;
+                            let marker_start =
+                                snapshot.anchor_before(MultiBufferOffset(abs_off));
+                            let marker_end =
+                                snapshot.anchor_after(MultiBufferOffset(abs_off + 3));
+                            let new_text: Arc<str> =
+                                if was_checked { "[ ]".into() } else { "[x]".into() };
+                            editor.buffer().update(cx, |buffer, cx| {
+                                buffer.edit(
+                                    [(marker_start..marker_end, new_text)],
+                                    None,
+                                    cx,
+                                );
+                            });
+                        })
+                        .ok();
+                });
+            }
+            checkbox.into_any_element()
+        }
         _ => div()
             .w(px(16.0))
             .flex_none()
