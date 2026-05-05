@@ -1,7 +1,6 @@
 use std::any::TypeId;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use collections::{HashMap, HashSet};
 use futures::FutureExt;
@@ -9,7 +8,7 @@ use gpui::prelude::InteractiveElement as _;
 use gpui::{
     App, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, ImageSource,
     IntoElement, MouseButton, ParentElement, Refineable, StrikethroughStyle, Styled, StyledImage,
-    StyledText, Task, TextStyle, WeakEntity, Window, canvas, div, px,
+    StyledText, Task, TextStyle, WeakEntity, Window, div, px,
 };
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use markdown::{
@@ -26,7 +25,6 @@ use markdown::{
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use settings::Settings;
 use theme::ActiveTheme;
-use text::Point;
 use ui::{Checkbox, CopyButton, FluentBuilder, ToggleState, VisibleOnHover};
 
 use crate::display_map::ToDisplayPoint;
@@ -43,7 +41,7 @@ const IMAGE_BLOCK_MAX_HEIGHT_LINES: u32 = 32;
 const IMAGE_BLOCK_MAX_VISIBLE_LINE_FRACTION: f64 = 0.6;
 const IMAGE_BLOCK_MAX_WIDTH_PX: f32 = 900.0;
 const IMAGE_ESTIMATED_LINE_HEIGHT_PX: f32 = 20.0;
-const PREVIEW_LIST_LINE_HEIGHT_REMS: f32 = 1.3;
+const PREVIEW_LIST_LINE_HEIGHT_REMS: f32 = MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM;
 const HORIZONTAL_RULE_BLOCK_HEIGHT_LINES: u32 = 2;
 const ACTIVE_SOURCE_BACKGROUND_ALPHA: f32 = 0.35;
 const LIVE_PREVIEW_RIGHT_INSET_PX: f32 = 24.0;
@@ -73,10 +71,10 @@ pub struct MarkdownLivePreview {
     /// Inserted preview blocks keyed by their index into `nodes`.
     /// A node index is present here iff its Replace block is currently inserted.
     preview_blocks: HashMap<usize, CustomBlockId>,
-    /// Tracks which inline (non-replacement-preview) node indices had the cursor
+    /// Tracks which inline (non-block-replacement) node indices had the cursor
     /// inside them at the last sync. Used to avoid redundant fold mutations.
     inline_cursor_inside: HashSet<usize>,
-    /// Set to true after a refresh so the next sync_folds applies all folds from
+    /// Set to true after a refresh so the next sync applies all folds from
     /// scratch rather than only applying delta changes.
     needs_full_fold_sync: bool,
     /// Debounce task for re-parsing after buffer changes.
@@ -102,77 +100,53 @@ pub struct MarkdownDecoratorNode {
     pub full_range: Range<Anchor>,
     /// The specific decorator ranges to fold away (e.g., the `**` markers).
     pub decorator_ranges: Vec<Range<Anchor>>,
-    /// What kind of node this is, used to determine highlight styling.
-    pub kind: MarkdownNodeKind,
-    /// For nodes that warrant a background (fenced code, blockquote): the range to highlight.
-    pub background_range: Option<Range<Anchor>>,
-    /// For image nodes: the resolved URL text extracted from the link destination.
-    pub image_url: Option<String>,
-    /// For fenced code blocks: the language name from the info string, if present.
-    pub code_language: Option<String>,
-    /// Rendered preview text for block-level markdown nodes.
-    pub preview_text: Option<String>,
+    /// Kind-specific data for this node.
+    pub data: MarkdownNodeData,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarkdownNodeKind {
-    Heading(u8),
-    Paragraph,
+/// Kind-specific data for a markdown node. Each variant carries exactly the
+/// fields it needs — no optional fields that are only meaningful for some kinds.
+#[derive(Debug, Clone)]
+pub enum MarkdownNodeData {
+    // ── Inline nodes (fold + highlight decoration) ──────────────────────────
     Bold,
     Italic,
     BoldItalic,
     Strikethrough,
     InlineCode,
     Link,
-    Image,
-    Checkbox { checked: bool },
-    FencedCode,
-    Blockquote,
-    HorizontalRule,
-    Table,
-    HtmlBlock,
-    List,
+    Checkbox,
+    Paragraph,
     FrontMatter,
+
+    // ── Block nodes (Replace block decoration) ───────────────────────────────
+    Heading { level: u8, preview_text: String },
+    Image { url: String },
+    FencedCode { language: Option<String>, preview_text: String },
+    /// `body` has already had the outermost `> ` marker stripped from every
+    /// line, so the renderer does not need to re-do that work each frame.
+    Blockquote { body: String },
+    HorizontalRule,
+    Table { preview_text: String },
+    HtmlBlock { preview_text: String },
+    List { preview_text: String },
 }
 
-/// Shared click-targeting state for a block preview.
-/// The canvas child of each block writes its bounds and line-height here
-/// each frame; the global `on_mouse_event` handler reads them to check
-/// whether a click falls inside the block and to compute the correct
-/// source line to navigate to.
-struct BlockClickState {
-    top_y: AtomicU32,
-    line_height: AtomicU32,
-    left_x: AtomicU32,
-    right_x: AtomicU32,
-}
-
-impl BlockClickState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            top_y: AtomicU32::new(0),
-            line_height: AtomicU32::new(0),
-            left_x: AtomicU32::new(0),
-            right_x: AtomicU32::new(u32::MAX),
-        })
-    }
-}
-
-/// Returns one anchor per source line covered by `node.full_range`.
-/// Used to map a clicked rendered line back to the originating source line.
-fn node_line_anchors(
-    node: &MarkdownDecoratorNode,
-    multi_snapshot: &MultiBufferSnapshot,
-) -> Arc<[Anchor]> {
-    let start_offset = node.full_range.start.to_offset(multi_snapshot).0;
-    let end_offset = node.full_range.end.to_offset(multi_snapshot).0;
-    let start_point = multi_snapshot.offset_to_point(MultiBufferOffset(start_offset));
-    let end_point = multi_snapshot.offset_to_point(MultiBufferOffset(end_offset));
-    let start_row = start_point.row;
-    let end_row = end_point.row;
-    (start_row..=end_row)
-        .map(|row| multi_snapshot.anchor_before(Point::new(row, 0)))
-        .collect()
+/// Returns true if `data` represents a block-level node that gets a Replace block.
+/// These nodes are never folded; their decorator_ranges are only used for
+/// cursor-inside detection (to remove the block when the user clicks inside).
+fn is_block_replacement(data: &MarkdownNodeData) -> bool {
+    matches!(
+        data,
+        MarkdownNodeData::Heading { .. }
+            | MarkdownNodeData::Image { .. }
+            | MarkdownNodeData::FencedCode { .. }
+            | MarkdownNodeData::Blockquote { .. }
+            | MarkdownNodeData::HorizontalRule
+            | MarkdownNodeData::Table { .. }
+            | MarkdownNodeData::HtmlBlock { .. }
+            | MarkdownNodeData::List { .. }
+    )
 }
 
 /// Returns true if the editor should activate live preview for its current buffer.
@@ -230,8 +204,7 @@ pub fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor
         cx,
     );
 
-    apply_highlights(editor, &multi_snapshot, cx);
-    apply_background_highlights(editor, &multi_snapshot, cx);
+    apply_highlights(editor, cx);
     sync(editor, window, cx);
 }
 
@@ -240,9 +213,8 @@ pub fn update(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>
     sync(editor, window, cx);
 }
 
-/// Reconciles all live-preview decorations (folds, highlights, blocks) with
-/// the current cursor position. Safe to call at any time; only the minimum
-/// necessary changes are applied.
+/// Reconciles all live-preview decorations (folds, blocks) with the current
+/// cursor position in a single pass over the node list.
 fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let Some(preview) = editor.markdown_live_preview.as_ref() else {
         return;
@@ -258,74 +230,127 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .collect();
 
     let nodes = preview.nodes.clone();
+    let prev_cursor_inside = preview.inline_cursor_inside.clone();
+    let full_sync = preview.needs_full_fold_sync;
 
-    sync_folds(editor, &nodes, &cursor_offsets, &multi_snapshot, window, cx);
-    sync_blocks(editor, &nodes, &cursor_offsets, &multi_snapshot, window, cx);
-}
+    // Metrics for block height estimation, derived from live theme/font settings.
+    let editor_line_height = editor
+        .style(cx)
+        .text
+        .line_height_in_pixels(window.rem_size())
+        .as_f32()
+        .max(1.0);
+    let markdown_style = preview_markdown_style(window, cx);
+    let preview_font_size_px = markdown_style
+        .base_text_style
+        .font_size
+        .to_pixels(window.rem_size())
+        .as_f32();
+    // Matches the line_height = buffer_font_size * 1.75 formula in MarkdownStyle::themed.
+    let preview_line_height_px = preview_font_size_px * 1.75;
+    let preview_list_line_height_px = PREVIEW_LIST_LINE_HEIGHT_REMS * window.rem_size().as_f32();
 
-fn sync_folds(
-    editor: &mut Editor,
-    nodes: &[MarkdownDecoratorNode],
-    cursor_offsets: &[usize],
-    multi_snapshot: &MultiBufferSnapshot,
-    window: &mut Window,
-    cx: &mut Context<Editor>,
-) {
+    let base_dir: Option<Arc<std::path::Path>> = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buf| {
+            buf.read(cx)
+                .file()
+                .and_then(|f| f.as_local())
+                .map(|f| f.abs_path(cx))
+        })
+        .and_then(|p| p.parent().map(Arc::from));
+
+    let weak_editor = cx.weak_entity();
+    let visible_line_count = editor.visible_line_count().map(|count| count as u32);
+    let estimated_width = editor
+        .visible_column_count()
+        .map(|columns| (columns as f32 * 8.0).min(IMAGE_BLOCK_MAX_WIDTH_PX))
+        .unwrap_or(IMAGE_BLOCK_MAX_WIDTH_PX);
+
+    let existing: HashMap<usize, CustomBlockId> = editor
+        .markdown_live_preview
+        .as_ref()
+        .map(|p| p.preview_blocks.clone())
+        .unwrap_or_default();
+
     let mut to_fold: Vec<Crease<Anchor>> = Vec::new();
     let mut to_unfold: Vec<Range<Anchor>> = Vec::new();
     let mut active_source_ranges: Vec<Range<Anchor>> = Vec::new();
     let mut new_cursor_inside: HashSet<usize> = HashSet::default();
-
-    let (prev_cursor_inside, full_sync) = editor
-        .markdown_live_preview
-        .as_ref()
-        .map(|p| (p.inline_cursor_inside.clone(), p.needs_full_fold_sync))
-        .unwrap_or((HashSet::default(), true));
+    let mut to_remove: HashSet<CustomBlockId> = HashSet::default();
+    let mut to_remove_indices: Vec<usize> = Vec::new();
+    let mut to_insert: Vec<(usize, BlockProperties<Anchor>)> = Vec::new();
 
     for (node_index, node) in nodes.iter().enumerate() {
-        let node_start = node.full_range.start.to_offset(multi_snapshot).0;
-        let node_end = node.full_range.end.to_offset(multi_snapshot).0;
-
+        let node_start = node.full_range.start.to_offset(&multi_snapshot).0;
+        let node_end = node.full_range.end.to_offset(&multi_snapshot).0;
         let cursor_inside = cursor_offsets
             .iter()
             .any(|&offset| offset >= node_start && offset <= node_end);
 
-        if cursor_inside && uses_replacement_preview(node.kind) {
-            active_source_ranges.push(node.full_range.clone());
-        }
+        if is_block_replacement(&node.data) {
+            if cursor_inside {
+                active_source_ranges.push(node.full_range.clone());
+            }
 
-        if uses_replacement_preview(node.kind) {
-            // These nodes use Replace blocks, not creases. They never have folds to unfold,
-            // and adding their full_range to all_decorator_ranges triggers spurious unfold
-            // calls that cause block_map.sync to misplace Replace blocks.
-            continue;
-        }
-
-        if cursor_inside {
-            new_cursor_inside.insert(node_index);
-        }
-
-        if node.decorator_ranges.is_empty() {
-            continue;
-        }
-
-        let was_inside = prev_cursor_inside.contains(&node_index);
-
-        if !full_sync && cursor_inside == was_inside {
-            // State hasn't changed for this node: don't touch its folds.
-            continue;
-        }
-
-        if cursor_inside {
-            // Transitioning outside→inside (or full sync with cursor inside): remove the fold.
-            for range in &node.decorator_ranges {
-                to_unfold.push(range.clone());
+            let has_block = existing.contains_key(&node_index);
+            match (cursor_inside, has_block) {
+                (true, true) => {
+                    // Cursor entered: remove the preview block to reveal source.
+                    to_remove.insert(existing[&node_index]);
+                    to_remove_indices.push(node_index);
+                }
+                (false, false) => {
+                    // Cursor outside, no block yet: build and insert preview block.
+                    let start_anchor = node.full_range.start;
+                    let props = build_block_props(
+                        node,
+                        node_index,
+                        start_anchor,
+                        editor_line_height,
+                        preview_line_height_px,
+                        preview_list_line_height_px,
+                        base_dir.as_deref(),
+                        estimated_width,
+                        visible_line_count,
+                        &weak_editor,
+                        editor,
+                        cx,
+                    );
+                    if let Some(props) = props {
+                        to_insert.push((node_index, props));
+                    }
+                }
+                _ => {} // No change needed.
             }
         } else {
-            // Transitioning inside→outside (or full sync with cursor outside): add the fold.
-            for range in &node.decorator_ranges {
-                let placeholder = invisible_fold_placeholder();
-                to_fold.push(Crease::simple(range.clone(), placeholder));
+            // Inline node: manage folds.
+            if cursor_inside {
+                new_cursor_inside.insert(node_index);
+            }
+
+            if node.decorator_ranges.is_empty() {
+                continue;
+            }
+
+            let was_inside = prev_cursor_inside.contains(&node_index);
+            if !full_sync && cursor_inside == was_inside {
+                // State hasn't changed for this node: don't touch its folds.
+                continue;
+            }
+
+            if cursor_inside {
+                // Transitioning outside→inside (or full sync with cursor inside): remove the fold.
+                for range in &node.decorator_ranges {
+                    to_unfold.push(range.clone());
+                }
+            } else {
+                // Transitioning inside→outside (or full sync with cursor outside): add the fold.
+                for range in &node.decorator_ranges {
+                    to_fold.push(Crease::simple(range.clone(), invisible_fold_placeholder()));
+                }
             }
         }
     }
@@ -333,9 +358,26 @@ fn sync_folds(
     if !to_unfold.is_empty() {
         editor.unfold_ranges(&to_unfold, true, false, cx);
     }
-
     if !to_fold.is_empty() {
         editor.fold_creases(to_fold, false, window, cx);
+    }
+
+    if !to_remove.is_empty() {
+        editor.remove_blocks(to_remove, None, cx);
+        if let Some(preview) = editor.markdown_live_preview.as_mut() {
+            for index in to_remove_indices {
+                preview.preview_blocks.remove(&index);
+            }
+        }
+    }
+    if !to_insert.is_empty() {
+        let (node_indices, props_list): (Vec<_>, Vec<_>) = to_insert.into_iter().unzip();
+        let ids = editor.insert_blocks(props_list, None, cx);
+        if let Some(preview) = editor.markdown_live_preview.as_mut() {
+            for (node_index, block_id) in node_indices.into_iter().zip(ids) {
+                preview.preview_blocks.insert(node_index, block_id);
+            }
+        }
     }
 
     if let Some(preview) = editor.markdown_live_preview.as_mut() {
@@ -344,6 +386,175 @@ fn sync_folds(
     }
 
     apply_active_source_highlights(editor, active_source_ranges, cx);
+}
+
+/// Builds `BlockProperties` for a block-level node. Returns `None` if the node
+/// data is missing required fields (e.g., no preview text for a code block).
+#[allow(clippy::too_many_arguments)]
+fn build_block_props(
+    node: &MarkdownDecoratorNode,
+    node_index: usize,
+    start_anchor: Anchor,
+    editor_line_height: f32,
+    preview_line_height_px: f32,
+    preview_list_line_height_px: f32,
+    base_dir: Option<&std::path::Path>,
+    estimated_width: f32,
+    visible_line_count: Option<u32>,
+    weak_editor: &WeakEntity<Editor>,
+    editor: &Editor,
+    cx: &mut Context<Editor>,
+) -> Option<BlockProperties<Anchor>> {
+    let placement = BlockPlacement::Replace(node.full_range.start..=node.full_range.end);
+
+    let props = match &node.data {
+        MarkdownNodeData::Heading { level, preview_text } => BlockProperties {
+            placement,
+            height: Some(heading_block_height(*level)),
+            style: BlockStyle::Flex,
+            render: render_heading_block(
+                preview_text.clone(),
+                *level,
+                start_anchor,
+                weak_editor.clone(),
+            ),
+            priority: 0,
+        },
+
+        MarkdownNodeData::Image { url } => {
+            let resolved_url = resolve_image_url(url, base_dir);
+            let image_metadata =
+                image_block_metadata(&resolved_url, estimated_width, visible_line_count);
+            BlockProperties {
+                placement,
+                height: Some(image_metadata.height_lines),
+                style: BlockStyle::Flex,
+                render: render_image_block(
+                    resolved_url,
+                    image_metadata,
+                    start_anchor,
+                    weak_editor.clone(),
+                ),
+                priority: 0,
+            }
+        }
+
+        MarkdownNodeData::FencedCode { language: language_name, preview_text } => {
+            let text = trim_trailing_empty_lines(preview_text).to_string();
+            let height = preview_block_height(
+                text.lines().count(),
+                preview_line_height_px,
+                36.0,
+                editor_line_height,
+            );
+            let language = language_name.as_deref().and_then(|name| {
+                let registry = editor_language_registry(editor, cx)?;
+                registry
+                    .language_for_name(name)
+                    .now_or_never()
+                    .and_then(Result::ok)
+            });
+            let language = language.or_else(|| {
+                editor
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .and_then(|buffer| buffer.read(cx).language().cloned())
+            });
+            BlockProperties {
+                placement,
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render: render_code_block(text, language, node_index, start_anchor, weak_editor.clone()),
+                priority: 0,
+            }
+        }
+
+        MarkdownNodeData::Blockquote { body } => {
+            let height = preview_block_height(
+                body.lines().count(),
+                preview_line_height_px,
+                12.0,
+                editor_line_height,
+            );
+            BlockProperties {
+                placement,
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render: render_blockquote_block(body.clone(), start_anchor, weak_editor.clone()),
+                priority: 0,
+            }
+        }
+
+        MarkdownNodeData::HorizontalRule => BlockProperties {
+            placement,
+            height: Some(HORIZONTAL_RULE_BLOCK_HEIGHT_LINES),
+            style: BlockStyle::Flex,
+            render: render_horizontal_rule_block(start_anchor, weak_editor.clone()),
+            priority: 0,
+        },
+
+        MarkdownNodeData::Table { preview_text } => {
+            let height = preview_block_height(
+                preview_text.lines().count(),
+                preview_line_height_px,
+                12.0,
+                editor_line_height,
+            );
+            BlockProperties {
+                placement,
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render: render_table_block(preview_text.clone(), start_anchor, weak_editor.clone()),
+                priority: 0,
+            }
+        }
+
+        MarkdownNodeData::HtmlBlock { preview_text } => {
+            let height = preview_block_height(
+                preview_text.lines().count(),
+                preview_line_height_px,
+                24.0,
+                editor_line_height,
+            );
+            BlockProperties {
+                placement,
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render: render_html_block(preview_text.clone(), start_anchor, weak_editor.clone()),
+                priority: 0,
+            }
+        }
+
+        MarkdownNodeData::List { preview_text } => {
+            let height = preview_block_height(
+                preview_text.lines().count(),
+                preview_list_line_height_px,
+                6.0,
+                editor_line_height,
+            );
+            BlockProperties {
+                placement,
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render: render_list_block(preview_text.clone(), start_anchor, weak_editor.clone()),
+                priority: 0,
+            }
+        }
+
+        // Inline-only kinds — should never reach here since is_block_replacement filters them.
+        _ => return None,
+    };
+
+    Some(props)
+}
+
+fn editor_language_registry(editor: &Editor, cx: &App) -> Option<Arc<language::LanguageRegistry>> {
+    editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| buffer.read(cx).language_registry())
 }
 
 fn apply_active_source_highlights(
@@ -365,20 +576,6 @@ fn apply_active_source_highlights(
             cx,
         );
     }
-}
-
-fn uses_replacement_preview(kind: MarkdownNodeKind) -> bool {
-    matches!(
-        kind,
-        MarkdownNodeKind::Heading(_)
-            | MarkdownNodeKind::Image
-            | MarkdownNodeKind::FencedCode
-            | MarkdownNodeKind::Blockquote
-            | MarkdownNodeKind::HorizontalRule
-            | MarkdownNodeKind::Table
-            | MarkdownNodeKind::HtmlBlock
-            | MarkdownNodeKind::List
-    )
 }
 
 /// Removes all live preview folds, highlights, and block decorations from the editor.
@@ -411,11 +608,7 @@ pub fn remove_all(editor: &mut Editor, cx: &mut Context<Editor>) {
 }
 
 /// Applies rich-text highlight styles to markdown content ranges.
-fn apply_highlights(
-    editor: &mut Editor,
-    multi_snapshot: &MultiBufferSnapshot,
-    cx: &mut Context<Editor>,
-) {
+fn apply_highlights(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(preview) = editor.markdown_live_preview.as_ref() else {
         return;
     };
@@ -424,11 +617,11 @@ fn apply_highlights(
     let mut highlight_ranges: Vec<(HighlightStyle, Vec<Range<Anchor>>)> = Vec::new();
 
     for node in &nodes {
-        if uses_replacement_preview(node.kind) {
+        if is_block_replacement(&node.data) {
             continue;
         }
 
-        let style = highlight_style_for_kind(node.kind, cx);
+        let style = highlight_style_for_data(&node.data, cx);
         if let Some(style) = style {
             let content_range = node.full_range.clone();
             if let Some(entry) = highlight_ranges.iter_mut().find(|(s, _)| *s == style) {
@@ -446,348 +639,6 @@ fn apply_highlights(
     for (i, (style, ranges)) in highlight_ranges.into_iter().enumerate() {
         editor.highlight_text(HighlightKey::MarkdownLivePreview(i), ranges, style, cx);
     }
-
-    let _ = multi_snapshot; // used by caller to ensure snapshot is current
-}
-
-/// Applies background color highlights for fenced code blocks and blockquotes.
-fn apply_background_highlights(
-    editor: &mut Editor,
-    _multi_snapshot: &MultiBufferSnapshot,
-    cx: &mut Context<Editor>,
-) {
-    let Some(preview) = editor.markdown_live_preview.as_ref() else {
-        return;
-    };
-
-    let ranges: Vec<Range<Anchor>> = preview
-        .nodes
-        .iter()
-        .filter(|node| !uses_replacement_preview(node.kind))
-        .filter_map(|node| node.background_range.clone())
-        .collect();
-
-    editor.clear_background_highlights(HighlightKey::MarkdownLivePreviewBackground, cx);
-
-    if !ranges.is_empty() {
-        editor.highlight_background(
-            HighlightKey::MarkdownLivePreviewBackground,
-            &ranges,
-            |_index, theme| {
-                let mut color = theme.colors().editor_document_highlight_read_background;
-                color.a *= 0.6;
-                color
-            },
-            cx,
-        );
-    }
-}
-
-/// Reconciles Replace blocks with the current cursor positions.
-/// Inserts a block for each block-level node where the cursor is outside,
-/// and removes any existing block where the cursor has moved inside.
-/// No-ops for nodes whose cursor-inside state hasn't changed.
-fn sync_blocks(
-    editor: &mut Editor,
-    nodes: &[MarkdownDecoratorNode],
-    cursor_offsets: &[usize],
-    multi_snapshot: &MultiBufferSnapshot,
-    window: &mut Window,
-    cx: &mut Context<Editor>,
-) {
-    let editor_line_height = editor
-        .style(cx)
-        .text
-        .line_height_in_pixels(window.rem_size())
-        .as_f32()
-        .max(1.0);
-
-    let base_dir: Option<Arc<std::path::Path>> = editor
-        .buffer()
-        .read(cx)
-        .as_singleton()
-        .and_then(|buf| {
-            buf.read(cx)
-                .file()
-                .and_then(|f| f.as_local())
-                .map(|f| f.abs_path(cx))
-        })
-        .and_then(|p| p.parent().map(|dir| Arc::from(dir)));
-
-    let weak_editor = cx.weak_entity();
-    let visible_line_count = editor.visible_line_count().map(|count| count as u32);
-    let estimated_width = editor
-        .visible_column_count()
-        .map(|columns| (columns as f32 * 8.0).min(IMAGE_BLOCK_MAX_WIDTH_PX))
-        .unwrap_or(IMAGE_BLOCK_MAX_WIDTH_PX);
-
-    let mut to_remove: HashSet<CustomBlockId> = HashSet::default();
-    let mut to_remove_indices: Vec<usize> = Vec::new();
-    let mut to_insert: Vec<(usize, BlockProperties<Anchor>)> = Vec::new();
-
-    let existing: HashMap<usize, CustomBlockId> = editor
-        .markdown_live_preview
-        .as_ref()
-        .map(|p| p.preview_blocks.clone())
-        .unwrap_or_default();
-
-    for (node_index, node) in nodes.iter().enumerate() {
-        if !uses_replacement_preview(node.kind) {
-            continue;
-        }
-
-        let node_start = node.full_range.start.to_offset(multi_snapshot).0;
-        let node_end = node.full_range.end.to_offset(multi_snapshot).0;
-        let cursor_inside = cursor_offsets
-            .iter()
-            .any(|&offset| offset >= node_start && offset <= node_end);
-
-        let has_block = existing.contains_key(&node_index);
-
-        match (cursor_inside, has_block) {
-            (true, true) => {
-                // Cursor entered: remove the preview block to reveal source.
-                to_remove.insert(existing[&node_index]);
-                to_remove_indices.push(node_index);
-            }
-            (false, false) => {
-                // Cursor outside, no block yet: insert preview block.
-                let _replacement_end = replacement_end_anchor(node, multi_snapshot);
-                let line_anchors = node_line_anchors(node, multi_snapshot);
-                let click_state = BlockClickState::new();
-
-                let props = match node.kind {
-                    MarkdownNodeKind::Heading(level) => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(heading_block_height(level)),
-                            style: BlockStyle::Flex,
-                            render: render_heading_block(
-                                text,
-                                level,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::Image => {
-                        let Some(url_text) = node.image_url.as_deref() else {
-                            continue;
-                        };
-                        let resolved_url = resolve_image_url(url_text, base_dir.as_deref());
-                        let image_metadata =
-                            image_block_metadata(&resolved_url, estimated_width, visible_line_count);
-                        let render = render_image_block(
-                            resolved_url,
-                            image_metadata,
-                            line_anchors,
-                            click_state,
-                            weak_editor.clone(),
-                        );
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(image_metadata.height_lines),
-                            style: BlockStyle::Flex,
-                            render,
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::FencedCode => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        let text = trim_trailing_empty_lines(&text).to_string();
-                        let height = preview_block_height(
-                            text.lines().count(),
-                            14.0 * 1.75,
-                            36.0,
-                            editor_line_height,
-                        );
-                        let language =
-                            node.code_language.as_deref().and_then(|language_name| {
-                                let registry = editor
-                                    .buffer()
-                                    .read(cx)
-                                    .as_singleton()
-                                    .and_then(|buffer| buffer.read(cx).language_registry())?;
-                                registry
-                                    .language_for_name(language_name)
-                                    .now_or_never()
-                                    .and_then(Result::ok)
-                            });
-                        let language = language.or_else(|| {
-                            editor
-                                .buffer()
-                                .read(cx)
-                                .as_singleton()
-                                .and_then(|buffer| buffer.read(cx).language().cloned())
-                        });
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(height),
-                            style: BlockStyle::Flex,
-                            render: render_code_block(
-                                text,
-                                language,
-                                node_index,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::Blockquote => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        let height = preview_block_height(
-                            text.lines().count(),
-                            14.0 * 1.75,
-                            12.0,
-                            editor_line_height,
-                        );
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(height),
-                            style: BlockStyle::Flex,
-                            render: render_blockquote_block(
-                                text,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::HorizontalRule => BlockProperties {
-                        placement: BlockPlacement::Replace(
-                            node.full_range.start..=node.full_range.end,
-                        ),
-                        height: Some(HORIZONTAL_RULE_BLOCK_HEIGHT_LINES),
-                        style: BlockStyle::Flex,
-                        render: render_horizontal_rule_block(
-                            line_anchors,
-                            click_state,
-                            weak_editor.clone(),
-                        ),
-                        priority: 0,
-                    },
-                    MarkdownNodeKind::Table => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        let height = preview_block_height(
-                            text.lines().count(),
-                            14.0 * 1.75,
-                            12.0,
-                            editor_line_height,
-                        );
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(height),
-                            style: BlockStyle::Flex,
-                            render: render_table_block(
-                                text,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::HtmlBlock => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        let height = preview_block_height(
-                            text.lines().count(),
-                            14.0 * 1.75,
-                            24.0,
-                            editor_line_height,
-                        );
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(height),
-                            style: BlockStyle::Flex,
-                            render: render_html_block(
-                                text,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    MarkdownNodeKind::List => {
-                        let Some(text) = node.preview_text.clone() else {
-                            continue;
-                        };
-                        let height = preview_block_height(
-                            text.lines().count(),
-                            14.0 * PREVIEW_LIST_LINE_HEIGHT_REMS,
-                            6.0,
-                            editor_line_height,
-                        );
-                        BlockProperties {
-                            placement: BlockPlacement::Replace(
-                                node.full_range.start..=node.full_range.end,
-                            ),
-                            height: Some(height),
-                            style: BlockStyle::Flex,
-                            render: render_list_block(
-                                text,
-                                line_anchors,
-                                click_state,
-                                weak_editor.clone(),
-                            ),
-                            priority: 0,
-                        }
-                    }
-                    _ => continue,
-                };
-
-                to_insert.push((node_index, props));
-            }
-            _ => {} // No change needed.
-        }
-    }
-
-    if !to_remove.is_empty() {
-        editor.remove_blocks(to_remove, None, cx);
-        if let Some(preview) = editor.markdown_live_preview.as_mut() {
-            for index in to_remove_indices {
-                preview.preview_blocks.remove(&index);
-            }
-        }
-    }
-
-    if !to_insert.is_empty() {
-        let (node_indices, props_list): (Vec<_>, Vec<_>) = to_insert.into_iter().unzip();
-        let ids = editor.insert_blocks(props_list, None, cx);
-        if let Some(preview) = editor.markdown_live_preview.as_mut() {
-            for (node_index, block_id) in node_indices.into_iter().zip(ids) {
-                preview.preview_blocks.insert(node_index, block_id);
-            }
-        }
-    }
 }
 
 fn preview_block_height(
@@ -797,16 +648,8 @@ fn preview_block_height(
     editor_line_height: f32,
 ) -> u32 {
     ((line_count.max(1) as f32 * preview_line_height + vertical_padding) / editor_line_height)
-        .ceil() as u32
-}
-
-fn replacement_end_anchor(
-    node: &MarkdownDecoratorNode,
-    _multi_snapshot: &MultiBufferSnapshot,
-) -> Anchor {
-    match node.kind {
-        _ => node.full_range.end,
-    }
+        .ceil()
+        .max(1.0) as u32
 }
 
 fn preview_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
@@ -820,7 +663,6 @@ fn preview_markdown_font() -> MarkdownFont {
 fn heading_block_height(level: u8) -> u32 {
     match level {
         1 => 3,
-        2 => 2,
         _ => 2,
     }
 }
@@ -885,17 +727,43 @@ fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
     url.to_string()
 }
 
+/// Attaches a click handler that reveals the source for the block when the user
+/// clicks anywhere on the element, placing the cursor at the block's start anchor.
+fn attach_source_click_handler(
+    element: gpui::Div,
+    start_anchor: Anchor,
+    weak_editor: WeakEntity<Editor>,
+) -> gpui::Div {
+    element.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+        cx.stop_propagation();
+        let click_count = event.click_count;
+        let _ = weak_editor.update(cx, |editor, cx| {
+            // Explicitly focus the editor so keyboard input works after clicking a preview block.
+            editor.focus_handle(cx).focus(window, cx);
+            let snapshot = editor.snapshot(window, cx);
+            let display_point = start_anchor.to_display_point(&snapshot.display_snapshot);
+            editor.select(
+                SelectPhase::Begin {
+                    position: display_point,
+                    add: false,
+                    click_count,
+                },
+                window,
+                cx,
+            );
+        });
+    })
+}
+
 fn render_heading_block(
     text: String,
     level: u8,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let line_height = cx.line_height;
         let element = markdown_heading_div_for_level(&markdown_style, level, None)
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
@@ -904,14 +772,7 @@ fn render_heading_block(
             .child(text.as_ref().to_string());
         let mut element = element;
         element.style().refine(&markdown_style.heading);
-        let element = attach_source_click_handler(
-            element,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let element = attach_source_click_handler(element, start_anchor, weak_editor.clone());
         apply_markdown_heading_style_for_level(
             element,
             level,
@@ -926,8 +787,7 @@ fn render_heading_block(
 fn render_image_block(
     resolved_url: String,
     metadata: ImageBlockMetadata,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let resolved_url: Arc<str> = resolved_url.into();
@@ -940,21 +800,13 @@ fn render_image_block(
         } else {
             ImageSource::from(std::path::PathBuf::from(resolved_url.as_ref()))
         };
-        let line_height = cx.line_height;
         let container = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full()
             .py_0p5();
-        let container = attach_source_click_handler(
-            container,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         if !metadata.loaded_local_dimensions && !resolved_url.contains("://") {
             let colors = cx.app.theme().colors();
             return container
@@ -990,8 +842,7 @@ fn render_code_block(
     text: String,
     language: Option<Arc<Language>>,
     node_index: usize,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
@@ -999,7 +850,6 @@ fn render_code_block(
         let markdown_style = preview_markdown_style(cx.window, cx.app);
         let colors = cx.app.theme().colors();
         let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
-        let line_height = cx.line_height;
         let outer = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
@@ -1007,14 +857,7 @@ fn render_code_block(
             .h_full()
             .bg(colors.editor_background)
             .overflow_hidden();
-        let outer = attach_source_click_handler(
-            outer,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
 
         outer
             .child(
@@ -1164,70 +1007,49 @@ fn render_blockquote_body_elements(
 }
 
 fn render_blockquote_block(
-    text: String,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    body: String,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
-    let text: Arc<str> = text.into();
+    let body: Arc<str> = body.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        // Strip the outermost `> ` markers to get the body that may still
-        // contain inner `> ` lines for nested blockquotes.
-        let stripped = strip_blockquote_level(text.as_ref());
-        let callout = parse_markdown_blockquote_callout(&stripped);
-        let body = markdown_blockquote_body(&stripped, callout);
+        let callout = parse_markdown_blockquote_callout(body.as_ref());
+        let inner_body = markdown_blockquote_body(body.as_ref(), callout);
         let text_color = markdown_style
             .block_quote
             .color
             .unwrap_or_else(|| cx.app.theme().colors().text);
-        let line_height = cx.line_height;
         let outer = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let outer = attach_source_click_handler(
-            outer,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
         outer
             .child(
                 markdown_blockquote_div(&markdown_style, callout)
                     .text_size(markdown_style.base_text_style.font_size)
                     .text_color(text_color)
                     .line_height(markdown_style.base_text_style.line_height)
-                    .children(render_blockquote_body_elements(body, &markdown_style)),
+                    .children(render_blockquote_body_elements(inner_body, &markdown_style)),
             )
             .into_any_element()
     })
 }
 
 fn render_horizontal_rule_block(
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let line_height = cx.line_height;
         let container = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let container = attach_source_click_handler(
-            container,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         container
             .child(markdown_rule_div(&markdown_style).w_full())
             .into_any_element()
@@ -1236,29 +1058,20 @@ fn render_horizontal_rule_block(
 
 fn render_table_block(
     text: String,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let rows: Arc<[Vec<String>]> = parse_markdown_table_rows(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let line_height = cx.line_height;
         let col_count = rows.first().map_or(0, |row| row.len()) as u16;
         let outer = div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let outer = attach_source_click_handler(
-            outer,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
         outer
             .child(
                 markdown_table_div(&markdown_style, col_count, colors)
@@ -1298,8 +1111,7 @@ fn render_table_block(
 
 fn render_html_block(
     text: String,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
@@ -1307,7 +1119,6 @@ fn render_html_block(
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
         let text_style = preview_code_text_style(&markdown_style, cx.editor_style.text.clone());
-        let line_height = cx.line_height;
         let container =
             markdown_code_block_parent_div(&markdown_style, colors.border_variant, true)
                 .pl(cx.anchor_x)
@@ -1321,14 +1132,7 @@ fn render_html_block(
                 .overflow_hidden();
         let mut container = container;
         container.style().margin = Default::default();
-        let container = attach_source_click_handler(
-            container,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         container
             .child(
                 markdown_code_block_content_div()
@@ -1342,15 +1146,13 @@ fn render_html_block(
 
 fn render_list_block(
     text: String,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
+    start_anchor: Anchor,
     weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let items: Arc<[RenderedMarkdownListItem]> = parse_markdown_list_items(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let colors = cx.app.theme().colors();
         let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let line_height = cx.line_height;
         let container = markdown_list_div()
             .pl(cx.anchor_x)
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
@@ -1359,14 +1161,7 @@ fn render_list_block(
             .text_size(markdown_style.base_text_style.font_size)
             .text_color(markdown_style.base_text_style.color)
             .line_height(gpui::rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM));
-        let container = attach_source_click_handler(
-            container,
-            line_anchors.clone(),
-            click_state.clone(),
-            line_height,
-            weak_editor.clone(),
-            cx.window,
-        );
+        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         container
             .children(
                 items
@@ -1432,116 +1227,35 @@ fn preview_code_text_style(
     text_style
 }
 
-fn attach_source_click_handler(
-    element: gpui::Div,
-    line_anchors: Arc<[Anchor]>,
-    click_state: Arc<BlockClickState>,
-    line_height: gpui::Pixels,
-    weak_editor: WeakEntity<Editor>,
-    window: &mut Window,
-) -> gpui::Div {
-    let _ = window;
-    let click_state_canvas = click_state.clone();
-    let click_state_handler = click_state;
-    element
-        .child(
-            canvas(
-                move |bounds, _, _| {
-                    click_state_canvas
-                        .top_y
-                        .store(bounds.origin.y.as_f32().to_bits(), Ordering::Relaxed);
-                    click_state_canvas
-                        .line_height
-                        .store(line_height.as_f32().to_bits(), Ordering::Relaxed);
-                    click_state_canvas
-                        .left_x
-                        .store(bounds.origin.x.as_f32().to_bits(), Ordering::Relaxed);
-                    click_state_canvas.right_x.store(
-                        (bounds.origin.x + bounds.size.width).as_f32().to_bits(),
-                        Ordering::Relaxed,
-                    );
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_full(),
-        )
-        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-            cx.stop_propagation();
-            if line_anchors.is_empty() {
-                return;
-            }
-            let top_y = f32::from_bits(click_state_handler.top_y.load(Ordering::Relaxed));
-            let lh = f32::from_bits(click_state_handler.line_height.load(Ordering::Relaxed));
-            let line_index = if lh > 0.0 {
-                let y_offset = (event.position.y.as_f32() - top_y).max(0.0);
-                ((y_offset / lh).floor() as usize).min(line_anchors.len() - 1)
-            } else {
-                0
-            };
-            let target_anchor = line_anchors[line_index];
-            let click_count = event.click_count;
-            let _ = weak_editor.update(cx, |editor, cx| {
-                // Explicitly focus the editor so keyboard input works after clicking a preview block.
-                editor.focus_handle(cx).focus(window, cx);
-                // Use SelectPhase::Begin so that the normal selection machinery is engaged:
-                // this enables drag-select, double-click word select, etc. after the block
-                // is removed and the source is revealed.
-                let snapshot = editor.snapshot(window, cx);
-                let display_point = target_anchor.to_display_point(&snapshot.display_snapshot);
-                editor.select(
-                    SelectPhase::Begin {
-                        position: display_point,
-                        add: false,
-                        click_count,
-                    },
-                    window,
-                    cx,
-                );
-            });
-        })
-}
-
 /// Returns the highlight style to apply to the content of a markdown node.
-fn highlight_style_for_kind(kind: MarkdownNodeKind, cx: &App) -> Option<HighlightStyle> {
+fn highlight_style_for_data(data: &MarkdownNodeData, cx: &App) -> Option<HighlightStyle> {
     let colors = cx.theme().colors();
-    match kind {
-        MarkdownNodeKind::Heading(level) => {
-            let color = colors.text;
-            let weight = FontWeight::BOLD;
-            let fade_out = (level >= 5).then_some(0.1);
-            Some(HighlightStyle {
-                color: Some(color),
-                font_weight: Some(weight),
-                fade_out,
-                ..Default::default()
-            })
-        }
-        MarkdownNodeKind::Bold => Some(HighlightStyle {
+    match data {
+        MarkdownNodeData::Bold => Some(HighlightStyle {
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         }),
-        MarkdownNodeKind::Italic => Some(HighlightStyle {
+        MarkdownNodeData::Italic => Some(HighlightStyle {
             font_style: Some(FontStyle::Italic),
             ..Default::default()
         }),
-        MarkdownNodeKind::BoldItalic => Some(HighlightStyle {
+        MarkdownNodeData::BoldItalic => Some(HighlightStyle {
             font_weight: Some(FontWeight::BOLD),
             font_style: Some(FontStyle::Italic),
             ..Default::default()
         }),
-        MarkdownNodeKind::Strikethrough => Some(HighlightStyle {
+        MarkdownNodeData::Strikethrough => Some(HighlightStyle {
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(1.0),
                 color: None,
             }),
             ..Default::default()
         }),
-        MarkdownNodeKind::InlineCode => Some(HighlightStyle {
+        MarkdownNodeData::InlineCode => Some(HighlightStyle {
             background_color: Some(colors.editor_foreground.opacity(0.08)),
             ..Default::default()
         }),
-        MarkdownNodeKind::Link => Some(HighlightStyle {
+        MarkdownNodeData::Link => Some(HighlightStyle {
             background_color: Some(colors.editor_foreground.opacity(0.025)),
             color: Some(colors.text_accent),
             underline: Some(gpui::UnderlineStyle {
@@ -1551,23 +1265,28 @@ fn highlight_style_for_kind(kind: MarkdownNodeKind, cx: &App) -> Option<Highligh
             }),
             ..Default::default()
         }),
-        MarkdownNodeKind::Image => Some(HighlightStyle {
-            color: Some(colors.text_muted),
-            ..Default::default()
-        }),
-        MarkdownNodeKind::Checkbox { .. } => None,
-        MarkdownNodeKind::FencedCode => None,
-        MarkdownNodeKind::Blockquote => Some(HighlightStyle {
-            color: Some(colors.text_muted),
-            font_style: Some(FontStyle::Italic),
-            ..Default::default()
-        }),
-        MarkdownNodeKind::HorizontalRule
-        | MarkdownNodeKind::Table
-        | MarkdownNodeKind::HtmlBlock
-        | MarkdownNodeKind::List
-        | MarkdownNodeKind::Paragraph
-        | MarkdownNodeKind::FrontMatter => None,
+        MarkdownNodeData::Heading { level, .. } => {
+            let color = colors.text;
+            let weight = FontWeight::BOLD;
+            let fade_out = (*level >= 5).then_some(0.1);
+            Some(HighlightStyle {
+                color: Some(color),
+                font_weight: Some(weight),
+                fade_out,
+                ..Default::default()
+            })
+        }
+        // Block-replacement kinds don't get inline highlights.
+        MarkdownNodeData::Image { .. }
+        | MarkdownNodeData::FencedCode { .. }
+        | MarkdownNodeData::Blockquote { .. }
+        | MarkdownNodeData::HorizontalRule
+        | MarkdownNodeData::Table { .. }
+        | MarkdownNodeData::HtmlBlock { .. }
+        | MarkdownNodeData::List { .. }
+        | MarkdownNodeData::Checkbox
+        | MarkdownNodeData::Paragraph
+        | MarkdownNodeData::FrontMatter => None,
     }
 }
 
@@ -1615,7 +1334,7 @@ fn remove_ineligible_paragraph_nodes(
 ) -> Vec<MarkdownDecoratorNode> {
     let paragraph_ranges: Vec<Range<usize>> = nodes
         .iter()
-        .filter(|node| node.kind == MarkdownNodeKind::Paragraph)
+        .filter(|node| matches!(node.data, MarkdownNodeData::Paragraph))
         .map(|node| {
             node.full_range.start.to_offset(multi_snapshot).0
                 ..node.full_range.end.to_offset(multi_snapshot).0
@@ -1624,7 +1343,7 @@ fn remove_ineligible_paragraph_nodes(
     let replacement_ranges: Vec<Range<usize>> = nodes
         .iter()
         .filter(|node| {
-            node.kind != MarkdownNodeKind::Paragraph && uses_replacement_preview(node.kind)
+            !matches!(node.data, MarkdownNodeData::Paragraph) && is_block_replacement(&node.data)
         })
         .map(|node| {
             node.full_range.start.to_offset(multi_snapshot).0
@@ -1634,7 +1353,7 @@ fn remove_ineligible_paragraph_nodes(
     nodes
         .into_iter()
         .filter(|node| {
-            if node.kind != MarkdownNodeKind::Paragraph {
+            if !matches!(node.data, MarkdownNodeData::Paragraph) {
                 return true;
             }
 
@@ -1661,7 +1380,7 @@ fn collect_text_list_nodes(
         .collect::<String>();
     let fenced_code_ranges: Vec<Range<usize>> = nodes
         .iter()
-        .filter(|node| node.kind == MarkdownNodeKind::FencedCode)
+        .filter(|node| matches!(node.data, MarkdownNodeData::FencedCode { .. }))
         .map(|node| {
             node.full_range.start.to_offset(multi_snapshot).0
                 ..node.full_range.end.to_offset(multi_snapshot).0
@@ -1670,7 +1389,7 @@ fn collect_text_list_nodes(
 
     let existing_list_ranges: Vec<Range<usize>> = nodes
         .iter()
-        .filter(|node| node.kind == MarkdownNodeKind::List)
+        .filter(|node| matches!(node.data, MarkdownNodeData::List { .. }))
         .map(|node| {
             node.full_range.start.to_offset(multi_snapshot).0
                 ..node.full_range.end.to_offset(multi_snapshot).0
@@ -1682,11 +1401,7 @@ fn collect_text_list_nodes(
         nodes.push(MarkdownDecoratorNode {
             full_range: full_range.clone(),
             decorator_ranges: vec![full_range],
-            kind: MarkdownNodeKind::List,
-            background_range: None,
-            image_url: None,
-            code_language: None,
-            preview_text: Some(text),
+            data: MarkdownNodeData::List { preview_text: text },
         });
     }
 }
@@ -1766,7 +1481,7 @@ fn remove_inline_nodes_inside_fenced_code(
 ) -> Vec<MarkdownDecoratorNode> {
     let fenced_code_ranges: Vec<Range<usize>> = nodes
         .iter()
-        .filter(|node| node.kind == MarkdownNodeKind::FencedCode)
+        .filter(|node| matches!(node.data, MarkdownNodeData::FencedCode { .. }))
         .map(|node| {
             node.full_range.start.to_offset(multi_snapshot).0
                 ..node.full_range.end.to_offset(multi_snapshot).0
@@ -1781,14 +1496,14 @@ fn remove_inline_nodes_inside_fenced_code(
         .into_iter()
         .filter(|node| {
             if !matches!(
-                node.kind,
-                MarkdownNodeKind::Bold
-                    | MarkdownNodeKind::Italic
-                    | MarkdownNodeKind::BoldItalic
-                    | MarkdownNodeKind::Strikethrough
-                    | MarkdownNodeKind::InlineCode
-                    | MarkdownNodeKind::Link
-                    | MarkdownNodeKind::Image
+                node.data,
+                MarkdownNodeData::Bold
+                    | MarkdownNodeData::Italic
+                    | MarkdownNodeData::BoldItalic
+                    | MarkdownNodeData::Strikethrough
+                    | MarkdownNodeData::InlineCode
+                    | MarkdownNodeData::Link
+                    | MarkdownNodeData::Image { .. }
             ) {
                 return true;
             }
@@ -1821,6 +1536,16 @@ fn visit_block_nodes(
 ) {
     loop {
         let node = cursor.node();
+
+        // Skip error nodes — they represent incomplete/malformed input and may
+        // produce garbled ranges if descended into.
+        if node.is_error() {
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+            continue;
+        }
+
         match node.kind() {
             "atx_heading" => {
                 if let Some(decorator) = parse_atx_heading(node, snapshot, multi_snapshot) {
@@ -1857,32 +1582,34 @@ fn visit_block_nodes(
                 continue;
             }
             "thematic_break" => {
-                nodes.push(parse_plain_replacement_block(
-                    node,
-                    multi_snapshot,
-                    MarkdownNodeKind::HorizontalRule,
-                    None,
-                ));
+                let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+                nodes.push(MarkdownDecoratorNode {
+                    decorator_ranges: vec![full_range.clone()],
+                    full_range,
+                    data: MarkdownNodeData::HorizontalRule,
+                });
             }
             "pipe_table" => {
-                nodes.push(parse_plain_replacement_block(
-                    node,
-                    multi_snapshot,
-                    MarkdownNodeKind::Table,
-                    Some(snapshot.chars_for_range(node.byte_range()).collect()),
-                ));
+                let preview_text = snapshot.chars_for_range(node.byte_range()).collect();
+                let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+                nodes.push(MarkdownDecoratorNode {
+                    decorator_ranges: vec![full_range.clone()],
+                    full_range,
+                    data: MarkdownNodeData::Table { preview_text },
+                });
                 if !cursor.goto_next_sibling() {
                     break;
                 }
                 continue;
             }
             "html_block" => {
-                nodes.push(parse_plain_replacement_block(
-                    node,
-                    multi_snapshot,
-                    MarkdownNodeKind::HtmlBlock,
-                    Some(snapshot.chars_for_range(node.byte_range()).collect()),
-                ));
+                let preview_text = snapshot.chars_for_range(node.byte_range()).collect();
+                let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
+                nodes.push(MarkdownDecoratorNode {
+                    decorator_ranges: vec![full_range.clone()],
+                    full_range,
+                    data: MarkdownNodeData::HtmlBlock { preview_text },
+                });
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -1900,11 +1627,7 @@ fn visit_block_nodes(
                 nodes.push(MarkdownDecoratorNode {
                     decorator_ranges: vec![full_range.clone()],
                     full_range,
-                    kind: MarkdownNodeKind::FrontMatter,
-                    background_range: None,
-                    image_url: None,
-                    code_language: None,
-                    preview_text: None,
+                    data: MarkdownNodeData::FrontMatter,
                 });
                 if !cursor.goto_next_sibling() {
                     break;
@@ -1922,24 +1645,6 @@ fn visit_block_nodes(
         if !cursor.goto_next_sibling() {
             break;
         }
-    }
-}
-
-fn parse_plain_replacement_block(
-    node: Node<'_>,
-    multi_snapshot: &MultiBufferSnapshot,
-    kind: MarkdownNodeKind,
-    preview_text: Option<String>,
-) -> MarkdownDecoratorNode {
-    let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
-    MarkdownDecoratorNode {
-        full_range: full_range.clone(),
-        decorator_ranges: vec![full_range],
-        kind,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text,
     }
 }
 
@@ -1961,11 +1666,7 @@ fn parse_paragraph(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: vec![],
-        kind: MarkdownNodeKind::Paragraph,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: Some(preview_text),
+        data: MarkdownNodeData::Paragraph,
     })
 }
 
@@ -1980,7 +1681,6 @@ fn parse_image_paragraph(
     let parsed = parse_markdown_events(&source);
 
     let mut image_destination = None;
-    let mut alt_text = String::new();
     let mut in_image = false;
     let mut image_count: usize = 0;
     let mut paragraph_depth: usize = 0;
@@ -2004,12 +1704,8 @@ fn parse_image_paragraph(
             MarkdownEvent::End(MarkdownTagEnd::Image) => {
                 in_image = false;
             }
-            MarkdownEvent::Text if in_image => {
-                alt_text.push_str(&source[range.clone()]);
-            }
-            MarkdownEvent::SubstitutedText(text) if in_image => {
-                alt_text.push_str(&text);
-            }
+            MarkdownEvent::Text if in_image => {}
+            MarkdownEvent::SubstitutedText(_) if in_image => {}
             MarkdownEvent::Text => {
                 if !source[range.clone()].trim().is_empty() {
                     return None;
@@ -2043,17 +1739,13 @@ fn parse_image_paragraph(
         return None;
     }
 
-    let image_url = image_destination?;
+    let url = image_destination?;
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
 
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
-        kind: MarkdownNodeKind::Image,
-        background_range: None,
-        image_url: Some(image_url),
-        code_language: None,
-        preview_text: (!alt_text.trim().is_empty()).then_some(alt_text.trim().to_string()),
+        data: MarkdownNodeData::Image { url },
     })
 }
 
@@ -2195,11 +1887,10 @@ fn parse_atx_heading(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: vec![marker_range],
-        kind: MarkdownNodeKind::Heading(level),
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: Some(preview_text.trim().to_string()),
+        data: MarkdownNodeData::Heading {
+            level,
+            preview_text: preview_text.trim().to_string(),
+        },
     })
 }
 
@@ -2237,23 +1928,16 @@ fn parse_setext_heading(
     let underline_range = underline_range?;
     let node_range = node.byte_range();
     let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
-    let mut preview_text = snapshot
+    let preview_text = snapshot
         .chars_for_range(node_range.start..underline_range.start)
-        .collect::<String>();
-    let _text_start = node_range.start
-        + preview_text
-            .len()
-            .saturating_sub(preview_text.trim_start().len());
-    preview_text = preview_text.trim().to_string();
+        .collect::<String>()
+        .trim()
+        .to_string();
 
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: vec![byte_range_to_anchor_range(underline_range, multi_snapshot)],
-        kind: MarkdownNodeKind::Heading(level),
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: Some(preview_text),
+        data: MarkdownNodeData::Heading { level, preview_text },
     })
 }
 
@@ -2262,16 +1946,11 @@ fn parse_task_list_marker(
     _snapshot: &BufferSnapshot,
     multi_snapshot: &MultiBufferSnapshot,
 ) -> Option<MarkdownDecoratorNode> {
-    let checked = node.kind() == "task_list_marker_checked";
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
     Some(MarkdownDecoratorNode {
         full_range: full_range.clone(),
         decorator_ranges: vec![full_range],
-        kind: MarkdownNodeKind::Checkbox { checked },
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::Checkbox,
     })
 }
 
@@ -2282,7 +1961,7 @@ fn parse_fenced_code_block(
 ) -> Option<MarkdownDecoratorNode> {
     let mut content_start: Option<usize> = None;
     let mut content_end: Option<usize> = None;
-    let mut code_language: Option<String> = None;
+    let mut language: Option<String> = None;
 
     let mut child_cursor = node.walk();
     if child_cursor.goto_first_child() {
@@ -2290,14 +1969,13 @@ fn parse_fenced_code_block(
             let child = child_cursor.node();
             match child.kind() {
                 "info_string" => {
-                    let language = snapshot
+                    language = snapshot
                         .chars_for_range(child.byte_range())
                         .collect::<String>()
                         .trim()
                         .split_whitespace()
                         .next()
                         .map(str::to_string);
-                    code_language = language;
                 }
                 "code_fence_content" => {
                     content_start = Some(child.start_byte());
@@ -2314,7 +1992,7 @@ fn parse_fenced_code_block(
 
     let node_range = node.byte_range();
 
-    let (decorator_ranges, background_range, preview_text) =
+    let (decorator_ranges, preview_text) =
         if let (Some(start), Some(end)) = (content_start, content_end) {
             // Fold the opening fence line (up to where content begins) and the closing fence line.
             let mut ranges = Vec::new();
@@ -2330,17 +2008,15 @@ fn parse_fenced_code_block(
                     multi_snapshot,
                 ));
             }
-            let bg = byte_range_to_anchor_range(start..end, multi_snapshot);
             let text = snapshot.chars_for_range(start..end).collect::<String>();
-            (ranges, Some(bg), Some(text))
+            (ranges, Some(text))
         } else {
-            // No content node — fold the entire block, no background range.
+            // No content node — fold the entire block.
             (
                 vec![byte_range_to_anchor_range(
                     node_range.clone(),
                     multi_snapshot,
                 )],
-                None,
                 None,
             )
         };
@@ -2349,16 +2025,13 @@ fn parse_fenced_code_block(
         return None;
     }
 
+    let preview_text = preview_text?;
     let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
 
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges,
-        kind: MarkdownNodeKind::FencedCode,
-        background_range,
-        image_url: None,
-        code_language,
-        preview_text,
+        data: MarkdownNodeData::FencedCode { language, preview_text },
     })
 }
 
@@ -2393,30 +2066,25 @@ fn parse_blockquote(
         return None;
     }
 
-    // `block_quote_marker` and `block_continuation` include the following space when present.
     let decorator_ranges: Vec<Range<Anchor>> = marker_byte_ranges
         .iter()
         .map(|range| byte_range_to_anchor_range(range.clone(), multi_snapshot))
         .collect();
 
     let node_range = node.byte_range();
-    // Store raw source including `> ` markers so the renderer can build a
-    // nested blockquote structure for inner levels.
-    let preview_text = snapshot
+    // Strip the outermost level of `> ` markers at parse time so render closures
+    // receive already-processed body text rather than raw source.
+    let raw_source: String = snapshot
         .chars_for_range(node_range.clone())
-        .collect::<String>();
+        .collect();
+    let body = strip_blockquote_level(&raw_source);
 
-    let full_range = byte_range_to_anchor_range(node_range.clone(), multi_snapshot);
-    let background_range = Some(byte_range_to_anchor_range(node_range, multi_snapshot));
+    let full_range = byte_range_to_anchor_range(node_range, multi_snapshot);
 
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges,
-        kind: MarkdownNodeKind::Blockquote,
-        background_range,
-        image_url: None,
-        code_language: None,
-        preview_text: Some(preview_text),
+        data: MarkdownNodeData::Blockquote { body },
     })
 }
 
@@ -2470,12 +2138,12 @@ fn parse_emphasis_node(
         return None;
     }
 
-    let kind = if has_nested_emphasis {
-        MarkdownNodeKind::BoldItalic
+    let data = if has_nested_emphasis {
+        MarkdownNodeData::BoldItalic
     } else if is_strong {
-        MarkdownNodeKind::Bold
+        MarkdownNodeData::Bold
     } else {
-        MarkdownNodeKind::Italic
+        MarkdownNodeData::Italic
     };
 
     let full_range = byte_range_to_anchor_range(node.byte_range(), multi_snapshot);
@@ -2483,11 +2151,7 @@ fn parse_emphasis_node(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: delimiter_ranges,
-        kind,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data,
     })
 }
 
@@ -2522,11 +2186,7 @@ fn parse_strikethrough_node(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: delimiter_ranges,
-        kind: MarkdownNodeKind::Strikethrough,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::Strikethrough,
     })
 }
 
@@ -2562,11 +2222,7 @@ fn parse_code_span(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: delimiter_ranges,
-        kind: MarkdownNodeKind::InlineCode,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::InlineCode,
     })
 }
 
@@ -2586,11 +2242,7 @@ fn parse_autolink(
             byte_range_to_anchor_range(node_range.start..node_range.start + 1, multi_snapshot),
             byte_range_to_anchor_range(node_range.end - 1..node_range.end, multi_snapshot),
         ],
-        kind: MarkdownNodeKind::Link,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::Link,
     })
 }
 
@@ -2630,11 +2282,7 @@ fn parse_inline_link(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges: vec![open_bracket, tail],
-        kind: MarkdownNodeKind::Link,
-        background_range: None,
-        image_url: None,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::Link,
     })
 }
 
@@ -2665,7 +2313,7 @@ fn parse_image(
     let node_range = node.byte_range();
 
     // Extract URL text from the link_destination node.
-    let image_url: Option<String> = link_dest_range.as_ref().map(|dest_range| {
+    let url: Option<String> = link_dest_range.as_ref().map(|dest_range| {
         let url = snapshot
             .chars_for_range(dest_range.clone())
             .collect::<String>();
@@ -2701,11 +2349,7 @@ fn parse_image(
     Some(MarkdownDecoratorNode {
         full_range,
         decorator_ranges,
-        kind: MarkdownNodeKind::Image,
-        background_range: None,
-        image_url,
-        code_language: None,
-        preview_text: None,
+        data: MarkdownNodeData::Image { url: url.unwrap_or_default() },
     })
 }
 
@@ -2727,23 +2371,26 @@ mod tests {
     }
 
     #[test]
-    fn test_highlight_style_bold() {
-        assert_eq!(MarkdownNodeKind::Bold, MarkdownNodeKind::Bold);
-        assert_ne!(MarkdownNodeKind::Bold, MarkdownNodeKind::Italic);
+    fn test_is_block_replacement() {
+        assert!(is_block_replacement(&MarkdownNodeData::HorizontalRule));
+        assert!(is_block_replacement(&MarkdownNodeData::Heading {
+            level: 1,
+            preview_text: String::new()
+        }));
+        assert!(!is_block_replacement(&MarkdownNodeData::Bold));
+        assert!(!is_block_replacement(&MarkdownNodeData::Italic));
+        assert!(!is_block_replacement(&MarkdownNodeData::InlineCode));
     }
 
     #[test]
-    fn test_node_kind_equality() {
-        assert_eq!(MarkdownNodeKind::Heading(1), MarkdownNodeKind::Heading(1));
-        assert_ne!(MarkdownNodeKind::Heading(1), MarkdownNodeKind::Heading(2));
-        assert_eq!(
-            MarkdownNodeKind::Checkbox { checked: true },
-            MarkdownNodeKind::Checkbox { checked: true }
-        );
-        assert_ne!(
-            MarkdownNodeKind::Checkbox { checked: true },
-            MarkdownNodeKind::Checkbox { checked: false }
-        );
+    fn test_node_data_variants() {
+        assert!(matches!(MarkdownNodeData::Bold, MarkdownNodeData::Bold));
+        assert!(!matches!(MarkdownNodeData::Bold, MarkdownNodeData::Italic));
+        assert!(matches!(
+            MarkdownNodeData::Heading { level: 1, preview_text: String::new() },
+            MarkdownNodeData::Heading { level: 1, .. }
+        ));
+        assert!(matches!(MarkdownNodeData::Checkbox, MarkdownNodeData::Checkbox));
     }
 
     #[test]
@@ -2868,5 +2515,18 @@ mod tests {
         assert!(!markdown::is_markdown_table_delimiter_row(
             "| Name | Value |"
         ));
+    }
+
+    #[test]
+    fn test_strip_blockquote_level() {
+        assert_eq!(strip_blockquote_level("> hello\n> world"), "hello\nworld");
+        assert_eq!(strip_blockquote_level(">hello"), "hello");
+        assert_eq!(strip_blockquote_level("> > nested"), "> nested");
+    }
+
+    #[test]
+    fn test_preview_block_height_min_one() {
+        // Even with zero lines the height should be at least 1.
+        assert_eq!(preview_block_height(0, 20.0, 0.0, 20.0), 1);
     }
 }
