@@ -3875,7 +3875,7 @@ impl Editor {
         cx.emit(EditorEvent::SelectionsChanged { local });
 
         if self.markdown_live_preview.is_some() {
-            markdown_live_preview::update_folds(self, window, cx);
+            markdown_live_preview::update(self, window, cx);
         }
 
         let selections = &self.selections.disjoint_anchors_arc();
