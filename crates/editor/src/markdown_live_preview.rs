@@ -6,20 +6,19 @@ use collections::{HashMap, HashSet};
 use futures::FutureExt;
 use gpui::prelude::InteractiveElement as _;
 use gpui::{
-    App, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, ImageSource,
+    App, Context, ElementId, FontStyle, FontWeight, HighlightStyle, ImageSource,
     IntoElement, MouseButton, ParentElement, Refineable, StrikethroughStyle, Styled, StyledImage,
     StyledText, Task, TextStyle, WeakEntity, Window, div, px,
 };
 use language::{BufferSnapshot, Language, LanguageName, Node, TreeCursor};
 use markdown::{
-    MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM, MarkdownEvent, MarkdownFont, MarkdownStyle, MarkdownTag,
-    MarkdownTagEnd, RenderedMarkdownListItem, apply_markdown_heading_style_for_level,
+    MarkdownEvent, MarkdownFont, MarkdownStyle, MarkdownTag,
+    MarkdownTagEnd, apply_markdown_heading_style_for_level,
     markdown_blockquote_body, markdown_blockquote_div,
     markdown_code_block_content_div, markdown_code_block_parent_div,
-    markdown_heading_div_for_level, markdown_list_div, markdown_list_item_content_div,
-    markdown_list_item_div, markdown_rule_div, markdown_table_cell_div,
+    markdown_heading_div_for_level, markdown_rule_div, markdown_table_cell_div,
     markdown_table_div, parse_markdown_blockquote_callout, parse_markdown_events,
-    parse_markdown_list_item_line, parse_markdown_list_items, parse_markdown_table_rows,
+    parse_markdown_table_rows,
     render_markdown_paragraph_lines,
 };
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
@@ -27,8 +26,7 @@ use settings::Settings;
 use theme::ActiveTheme;
 use ui::{Checkbox, CopyButton, FluentBuilder, ToggleState, VisibleOnHover};
 
-use crate::display_map::ToDisplayPoint;
-use crate::{Editor, SelectPhase};
+use crate::{Editor};
 use crate::display_map::{
     BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId, FoldPlaceholder,
     HighlightKey, RenderBlock,
@@ -41,7 +39,6 @@ const IMAGE_BLOCK_MAX_HEIGHT_LINES: u32 = 32;
 const IMAGE_BLOCK_MAX_VISIBLE_LINE_FRACTION: f64 = 0.6;
 const IMAGE_BLOCK_MAX_WIDTH_PX: f32 = 900.0;
 const IMAGE_ESTIMATED_LINE_HEIGHT_PX: f32 = 20.0;
-const PREVIEW_LIST_LINE_HEIGHT_REMS: f32 = MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM;
 const HORIZONTAL_RULE_BLOCK_HEIGHT_LINES: u32 = 2;
 const ACTIVE_SOURCE_BACKGROUND_ALPHA: f32 = 0.35;
 const LIVE_PREVIEW_RIGHT_INSET_PX: f32 = 24.0;
@@ -115,7 +112,12 @@ pub enum MarkdownNodeData {
     Strikethrough,
     InlineCode,
     Link,
+    /// A task list checkbox (`[ ]` or `[x]`). Folded and replaced with an
+    /// interactive Checkbox widget rendered inline.
     Checkbox,
+    /// A list item marker (`-`, `*`, `+`, or `1.`). Folded and replaced with
+    /// a rendered bullet or number inline.
+    ListMarker { bullet: String },
     Paragraph,
     FrontMatter,
 
@@ -129,7 +131,6 @@ pub enum MarkdownNodeData {
     HorizontalRule,
     Table { preview_text: String },
     HtmlBlock { preview_text: String },
-    List { preview_text: String },
 }
 
 /// Returns true if `data` represents a block-level node that gets a Replace block.
@@ -145,7 +146,6 @@ fn is_block_replacement(data: &MarkdownNodeData) -> bool {
             | MarkdownNodeData::HorizontalRule
             | MarkdownNodeData::Table { .. }
             | MarkdownNodeData::HtmlBlock { .. }
-            | MarkdownNodeData::List { .. }
     )
 }
 
@@ -248,7 +248,6 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .as_f32();
     // Matches the line_height = buffer_font_size * 1.75 formula in MarkdownStyle::themed.
     let preview_line_height_px = preview_font_size_px * 1.75;
-    let preview_list_line_height_px = PREVIEW_LIST_LINE_HEIGHT_REMS * window.rem_size().as_f32();
 
     let base_dir: Option<Arc<std::path::Path>> = editor
         .buffer()
@@ -304,18 +303,14 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 }
                 (false, false) => {
                     // Cursor outside, no block yet: build and insert preview block.
-                    let start_anchor = node.full_range.start;
                     let props = build_block_props(
                         node,
                         node_index,
-                        start_anchor,
                         editor_line_height,
                         preview_line_height_px,
-                        preview_list_line_height_px,
                         base_dir.as_deref(),
                         estimated_width,
                         visible_line_count,
-                        &weak_editor,
                         editor,
                         cx,
                     );
@@ -329,12 +324,6 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             // Inline node: manage folds.
             if cursor_inside {
                 new_cursor_inside.insert(node_index);
-            }
-
-            // Checkbox markers are always covered by a parent List block replacement;
-            // folding them independently causes `[ ]`/`[x]` to disappear in source mode.
-            if matches!(node.data, MarkdownNodeData::Checkbox) {
-                continue;
             }
 
             if node.decorator_ranges.is_empty() {
@@ -355,7 +344,16 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             } else {
                 // Transitioning inside→outside (or full sync with cursor outside): add the fold.
                 for range in &node.decorator_ranges {
-                    to_fold.push(Crease::simple(range.clone(), invisible_fold_placeholder()));
+                    let placeholder = match &node.data {
+                        MarkdownNodeData::Checkbox => {
+                            checkbox_fold_placeholder(weak_editor.clone())
+                        }
+                        MarkdownNodeData::ListMarker { bullet } => {
+                            list_marker_fold_placeholder(bullet.clone())
+                        }
+                        _ => invisible_fold_placeholder(),
+                    };
+                    to_fold.push(Crease::simple(range.clone(), placeholder));
                 }
             }
         }
@@ -400,14 +398,11 @@ fn sync(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 fn build_block_props(
     node: &MarkdownDecoratorNode,
     node_index: usize,
-    start_anchor: Anchor,
     editor_line_height: f32,
     preview_line_height_px: f32,
-    preview_list_line_height_px: f32,
     base_dir: Option<&std::path::Path>,
     estimated_width: f32,
     visible_line_count: Option<u32>,
-    weak_editor: &WeakEntity<Editor>,
     editor: &Editor,
     cx: &mut Context<Editor>,
 ) -> Option<BlockProperties<Anchor>> {
@@ -421,8 +416,6 @@ fn build_block_props(
             render: render_heading_block(
                 preview_text.clone(),
                 *level,
-                start_anchor,
-                weak_editor.clone(),
             ),
             priority: 0,
         },
@@ -438,8 +431,6 @@ fn build_block_props(
                 render: render_image_block(
                     resolved_url,
                     image_metadata,
-                    start_anchor,
-                    weak_editor.clone(),
                 ),
                 priority: 0,
             }
@@ -471,7 +462,7 @@ fn build_block_props(
                 placement,
                 height: Some(height),
                 style: BlockStyle::Flex,
-                render: render_code_block(text, language, node_index, start_anchor, weak_editor.clone()),
+                render: render_code_block(text, language, node_index),
                 priority: 0,
             }
         }
@@ -487,7 +478,7 @@ fn build_block_props(
                 placement,
                 height: Some(height),
                 style: BlockStyle::Flex,
-                render: render_blockquote_block(body.clone(), start_anchor, weak_editor.clone()),
+                render: render_blockquote_block(body.clone()),
                 priority: 0,
             }
         }
@@ -496,7 +487,7 @@ fn build_block_props(
             placement,
             height: Some(HORIZONTAL_RULE_BLOCK_HEIGHT_LINES),
             style: BlockStyle::Flex,
-            render: render_horizontal_rule_block(start_anchor, weak_editor.clone()),
+            render: render_horizontal_rule_block(),
             priority: 0,
         },
 
@@ -511,7 +502,7 @@ fn build_block_props(
                 placement,
                 height: Some(height),
                 style: BlockStyle::Flex,
-                render: render_table_block(preview_text.clone(), start_anchor, weak_editor.clone()),
+                render: render_table_block(preview_text.clone()),
                 priority: 0,
             }
         }
@@ -527,23 +518,7 @@ fn build_block_props(
                 placement,
                 height: Some(height),
                 style: BlockStyle::Flex,
-                render: render_html_block(preview_text.clone(), start_anchor, weak_editor.clone()),
-                priority: 0,
-            }
-        }
-
-        MarkdownNodeData::List { preview_text } => {
-            let height = preview_block_height(
-                preview_text.lines().count(),
-                preview_list_line_height_px,
-                6.0,
-                editor_line_height,
-            );
-            BlockProperties {
-                placement,
-                height: Some(height),
-                style: BlockStyle::Flex,
-                render: render_list_block(preview_text.clone(), start_anchor, weak_editor.clone()),
+                render: render_html_block(preview_text.clone()),
                 priority: 0,
             }
         }
@@ -735,37 +710,11 @@ fn resolve_image_url(url: &str, base_dir: Option<&std::path::Path>) -> String {
 
 /// Attaches a click handler that reveals the source for the block when the user
 /// clicks anywhere on the element, placing the cursor at the block's start anchor.
-fn attach_source_click_handler(
-    element: gpui::Div,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
-) -> gpui::Div {
-    element.on_mouse_down(MouseButton::Left, move |event, window, cx| {
-        cx.stop_propagation();
-        let click_count = event.click_count;
-        let _ = weak_editor.update(cx, |editor, cx| {
-            // Explicitly focus the editor so keyboard input works after clicking a preview block.
-            editor.focus_handle(cx).focus(window, cx);
-            let snapshot = editor.snapshot(window, cx);
-            let display_point = start_anchor.to_display_point(&snapshot.display_snapshot);
-            editor.select(
-                SelectPhase::Begin {
-                    position: display_point,
-                    add: false,
-                    click_count,
-                },
-                window,
-                cx,
-            );
-        });
-    })
-}
+
 
 fn render_heading_block(
     text: String,
     level: u8,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -778,7 +727,6 @@ fn render_heading_block(
             .child(text.as_ref().to_string());
         let mut element = element;
         element.style().refine(&markdown_style.heading);
-        let element = attach_source_click_handler(element, start_anchor, weak_editor.clone());
         apply_markdown_heading_style_for_level(
             element,
             level,
@@ -793,8 +741,6 @@ fn render_heading_block(
 fn render_image_block(
     resolved_url: String,
     metadata: ImageBlockMetadata,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let resolved_url: Arc<str> = resolved_url.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -812,7 +758,6 @@ fn render_image_block(
             .w_full()
             .h_full()
             .py_0p5();
-        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         if !metadata.loaded_local_dimensions && !resolved_url.contains("://") {
             let colors = cx.app.theme().colors();
             return container
@@ -848,8 +793,6 @@ fn render_code_block(
     text: String,
     language: Option<Arc<Language>>,
     node_index: usize,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -863,7 +806,6 @@ fn render_code_block(
             .h_full()
             .bg(colors.editor_background)
             .overflow_hidden();
-        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
 
         outer
             .child(
@@ -1014,8 +956,6 @@ fn render_blockquote_body_elements(
 
 fn render_blockquote_block(
     body: String,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let body: Arc<str> = body.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -1031,7 +971,6 @@ fn render_blockquote_block(
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
         outer
             .child(
                 markdown_blockquote_div(&markdown_style, callout)
@@ -1044,10 +983,7 @@ fn render_blockquote_block(
     })
 }
 
-fn render_horizontal_rule_block(
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
-) -> RenderBlock {
+fn render_horizontal_rule_block() -> RenderBlock {
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
         let markdown_style = preview_markdown_style(cx.window, cx.app);
         let container = div()
@@ -1055,7 +991,6 @@ fn render_horizontal_rule_block(
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         container
             .child(markdown_rule_div(&markdown_style).w_full())
             .into_any_element()
@@ -1064,8 +999,6 @@ fn render_horizontal_rule_block(
 
 fn render_table_block(
     text: String,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let rows: Arc<[Vec<String>]> = parse_markdown_table_rows(&text).into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -1077,7 +1010,6 @@ fn render_table_block(
             .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
             .w_full()
             .h_full();
-        let outer = attach_source_click_handler(outer, start_anchor, weak_editor.clone());
         outer
             .child(
                 markdown_table_div(&markdown_style, col_count, colors)
@@ -1117,8 +1049,6 @@ fn render_table_block(
 
 fn render_html_block(
     text: String,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
 ) -> RenderBlock {
     let text: Arc<str> = text.into();
     Arc::new(move |cx: &mut crate::display_map::BlockContext| {
@@ -1138,7 +1068,6 @@ fn render_html_block(
                 .overflow_hidden();
         let mut container = container;
         container.style().margin = Default::default();
-        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
         container
             .child(
                 markdown_code_block_content_div()
@@ -1150,106 +1079,55 @@ fn render_html_block(
     })
 }
 
-/// For each parsed list item, returns the byte offset of its `[ ]`/`[x]` marker
-/// within the full list text, along with the current checked state.
-/// Returns `None` for non-checkbox items.
-fn checkbox_marker_offsets(text: &str) -> Vec<Option<(usize, bool)>> {
-    use markdown::parse_markdown_list_item_line;
-    let mut result = Vec::new();
-    let mut byte_offset = 0usize;
-    for line in text.split('\n') {
-        if let Some(item) = parse_markdown_list_item_line(line) {
-            let marker_offset = match item.marker.as_str() {
-                "[ ]" => line
-                    .find("[ ]")
-                    .map(|pos| (byte_offset + pos, false)),
-                "[x]" => line
-                    .find("[x]")
-                    .or_else(|| line.find("[X]"))
-                    .map(|pos| (byte_offset + pos, true)),
-                _ => None,
-            };
-            result.push(marker_offset);
-        }
-        byte_offset += line.len() + 1; // +1 for '\n'
+/// Creates a fold placeholder that renders an inline bullet or ordered marker.
+fn list_marker_fold_placeholder(bullet: String) -> FoldPlaceholder {
+    FoldPlaceholder {
+        render: Arc::new(move |_, _, _| {
+            gpui::StyledText::new(bullet.clone()).into_any_element()
+        }),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(TypeId::of::<MarkdownLivePreviewFold>()),
+        collapsed_text: None,
+        hide_fold_indicator: true,
     }
-    result
 }
 
-fn render_list_block(
-    text: String,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
-) -> RenderBlock {
-    let items: Arc<[RenderedMarkdownListItem]> = parse_markdown_list_items(&text).into();
-    let marker_offsets: Arc<[Option<(usize, bool)>]> =
-        checkbox_marker_offsets(&text).into();
-    Arc::new(move |cx: &mut crate::display_map::BlockContext| {
-        let colors = cx.app.theme().colors();
-        let markdown_style = preview_markdown_style(cx.window, cx.app);
-        let container = markdown_list_div()
-            .pl(cx.anchor_x)
-            .pr(px(LIVE_PREVIEW_RIGHT_INSET_PX))
-            .w_full()
-            .h_full()
-            .text_size(markdown_style.base_text_style.font_size)
-            .text_color(markdown_style.base_text_style.color)
-            .line_height(gpui::rems(MARKDOWN_PARAGRAPH_LINE_HEIGHT_REM));
-        let container = attach_source_click_handler(container, start_anchor, weak_editor.clone());
-        container
-            .children(
-                items
-                    .iter()
-                    .zip(marker_offsets.iter())
-                    .map(|(item, marker_offset)| {
-                        render_list_item(
-                            item,
-                            *marker_offset,
-                            start_anchor,
-                            weak_editor.clone(),
-                            colors.text,
-                            &markdown_style,
-                        )
-                    }),
-            )
-            .into_any_element()
-    })
-}
+/// Creates a fold placeholder that renders an interactive `Checkbox` widget inline.
+/// The checked state is derived from the buffer text at the fold range at render time.
+fn checkbox_fold_placeholder(weak_editor: WeakEntity<Editor>) -> FoldPlaceholder {
+    FoldPlaceholder {
+        render: Arc::new(move |fold_id, range, cx| {
+            let checked = weak_editor
+                .read_with(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let start = range.start.to_offset(&snapshot).0;
+                    let end = range.end.to_offset(&snapshot).0;
+                    snapshot.text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end)).collect::<String>()
+                })
+                .map(|text| text == "[x]" || text == "[X]")
+                .unwrap_or(false);
 
-fn render_list_item(
-    item: &RenderedMarkdownListItem,
-    marker_offset: Option<(usize, bool)>,
-    start_anchor: Anchor,
-    weak_editor: WeakEntity<Editor>,
-    marker_color: gpui::Hsla,
-    markdown_style: &MarkdownStyle,
-) -> gpui::AnyElement {
-    let marker_element = match item.marker.as_str() {
-        "[ ]" | "[x]" => {
-            let checked = item.marker == "[x]";
             let toggle_state = if checked {
                 ToggleState::Selected
             } else {
                 ToggleState::Unselected
             };
-            let mut checkbox = Checkbox::new(
-                if checked { "checked" } else { "unchecked" },
-                toggle_state,
-            )
-            .fill();
-            if let Some((offset, was_checked)) = marker_offset {
-                checkbox = checkbox.on_click(move |_state, _window, cx| {
-                    weak_editor
+            let weak_editor_click = weak_editor.clone();
+            Checkbox::new(ElementId::from(fold_id), toggle_state)
+                .fill()
+                .on_click(move |_state, _window, cx| {
+                    weak_editor_click
                         .update(cx, |editor, cx| {
                             let snapshot = editor.buffer().read(cx).snapshot(cx);
-                            let start_off = start_anchor.to_offset(&snapshot).0;
-                            let abs_off = start_off + offset;
+                            let start = range.start.to_offset(&snapshot).0;
+                            let end = range.end.to_offset(&snapshot).0;
                             let marker_start =
-                                snapshot.anchor_before(MultiBufferOffset(abs_off));
+                                snapshot.anchor_before(MultiBufferOffset(start));
                             let marker_end =
-                                snapshot.anchor_after(MultiBufferOffset(abs_off + 3));
+                                snapshot.anchor_after(MultiBufferOffset(end));
                             let new_text: Arc<str> =
-                                if was_checked { "[ ]".into() } else { "[x]".into() };
+                                if checked { "[ ]".into() } else { "[x]".into() };
                             editor.buffer().update(cx, |buffer, cx| {
                                 buffer.edit(
                                     [(marker_start..marker_end, new_text)],
@@ -1259,26 +1137,15 @@ fn render_list_item(
                             });
                         })
                         .ok();
-                });
-            }
-            checkbox.into_any_element()
-        }
-        _ => div()
-            .w(px(16.0))
-            .flex_none()
-            .text_color(marker_color)
-            .child(item.marker.clone())
-            .into_any_element(),
-    };
-
-    markdown_list_item_div(markdown_style, marker_element)
-        .mb_1()
-        .pl(px(item.indent_columns as f32 * 12.0))
-        .child(
-            markdown_list_item_content_div()
-                .children(render_markdown_paragraph_lines(&item.text, markdown_style)),
-        )
-        .into_any_element()
+                })
+                .into_any_element()
+        }),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(TypeId::of::<MarkdownLivePreviewFold>()),
+        collapsed_text: None,
+        hide_fold_indicator: true,
+    }
 }
 
 fn preview_code_text_style(
@@ -1346,7 +1213,7 @@ fn highlight_style_for_data(data: &MarkdownNodeData, cx: &App) -> Option<Highlig
         | MarkdownNodeData::HorizontalRule
         | MarkdownNodeData::Table { .. }
         | MarkdownNodeData::HtmlBlock { .. }
-        | MarkdownNodeData::List { .. }
+        | MarkdownNodeData::ListMarker { .. }
         | MarkdownNodeData::Checkbox
         | MarkdownNodeData::Paragraph
         | MarkdownNodeData::FrontMatter => None,
@@ -1385,7 +1252,7 @@ pub fn collect_nodes(
         }
     }
 
-    collect_text_list_nodes(snapshot, multi_snapshot, &mut nodes);
+    collect_list_marker_nodes(snapshot, multi_snapshot, &mut nodes);
 
     let nodes = remove_ineligible_paragraph_nodes(nodes, multi_snapshot);
     remove_inline_nodes_inside_fenced_code(nodes, multi_snapshot)
@@ -1433,14 +1300,21 @@ fn remove_ineligible_paragraph_nodes(
         .collect()
 }
 
-fn collect_text_list_nodes(
+/// Collects `ListMarker` nodes for every list item line in the buffer.
+///
+/// Each node covers only the raw marker characters (e.g. `-`, `1.`) at the
+/// start of the item. The leading indentation and the space after the marker
+/// are left in the buffer so the editor handles spacing naturally. The fold
+/// placeholder renders the display form (`•`, `1.`, etc.) inline.
+///
+/// Lines inside fenced code blocks are skipped. Checkbox markers (`[ ]`,
+/// `[x]`) are handled separately by tree-sitter via `Checkbox` nodes; this
+/// function still emits a `ListMarker` for the bullet part of those lines.
+fn collect_list_marker_nodes(
     snapshot: &BufferSnapshot,
     multi_snapshot: &MultiBufferSnapshot,
     nodes: &mut Vec<MarkdownDecoratorNode>,
 ) {
-    let text = snapshot
-        .chars_for_range(0..snapshot.len())
-        .collect::<String>();
     let fenced_code_ranges: Vec<Range<usize>> = nodes
         .iter()
         .filter(|node| matches!(node.data, MarkdownNodeData::FencedCode { .. }))
@@ -1450,92 +1324,87 @@ fn collect_text_list_nodes(
         })
         .collect();
 
-    let existing_list_ranges: Vec<Range<usize>> = nodes
-        .iter()
-        .filter(|node| matches!(node.data, MarkdownNodeData::List { .. }))
-        .map(|node| {
-            node.full_range.start.to_offset(multi_snapshot).0
-                ..node.full_range.end.to_offset(multi_snapshot).0
-        })
-        .collect();
-
-    for (range, text) in text_list_ranges(&text, &fenced_code_ranges, &existing_list_ranges) {
-        let full_range = byte_range_to_anchor_range(range, multi_snapshot);
-        nodes.push(MarkdownDecoratorNode {
-            full_range: full_range.clone(),
-            decorator_ranges: vec![full_range],
-            data: MarkdownNodeData::List { preview_text: text },
-        });
-    }
-}
-
-fn text_list_ranges(
-    text: &str,
-    fenced_code_ranges: &[Range<usize>],
-    existing_list_ranges: &[Range<usize>],
-) -> Vec<(Range<usize>, String)> {
-    let mut ranges = Vec::new();
-    let mut block_start: Option<usize> = None;
-    let mut block_end = 0;
-    let mut block_text = String::new();
-    let mut offset = 0;
+    let text = snapshot
+        .chars_for_range(0..snapshot.len())
+        .collect::<String>();
+    let mut byte_offset = 0usize;
 
     for line in text.split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches(['\r', '\n']);
-        let line_start = offset;
-        let line_end = offset + line.len();
-        offset = line_end;
+        let line_start = byte_offset;
+        byte_offset += line.len();
 
+        let line_trimmed = line.trim_end_matches(['\r', '\n']);
+
+        // Skip lines inside fenced code blocks.
         let inside_fenced_code = fenced_code_ranges
             .iter()
             .any(|range| line_start >= range.start && line_start < range.end);
-        let is_list_line =
-            !inside_fenced_code && parse_markdown_list_item_line(line_without_newline).is_some();
-
-        if is_list_line {
-            if block_start.is_none() {
-                block_start = Some(line_start);
-            }
-            block_end = line_end;
-            block_text.push_str(line);
+        if inside_fenced_code {
             continue;
         }
 
-        push_text_list_range(
-            block_start.take(),
-            block_end,
-            &mut block_text,
-            existing_list_ranges,
-            &mut ranges,
-        );
+        if let Some((fold_range, bullet)) =
+            list_marker_fold_range(line_trimmed, line_start)
+        {
+            let full_range = byte_range_to_anchor_range(fold_range.clone(), multi_snapshot);
+            nodes.push(MarkdownDecoratorNode {
+                full_range: full_range.clone(),
+                decorator_ranges: vec![full_range],
+                data: MarkdownNodeData::ListMarker { bullet },
+            });
+        }
     }
-
-    push_text_list_range(
-        block_start,
-        block_end,
-        &mut block_text,
-        existing_list_ranges,
-        &mut ranges,
-    );
-
-    ranges
 }
 
-fn push_text_list_range(
-    block_start: Option<usize>,
-    block_end: usize,
-    block_text: &mut String,
-    existing_list_ranges: &[Range<usize>],
-    ranges: &mut Vec<(Range<usize>, String)>,
-) {
-    if let Some(block_start) = block_start
-        && !existing_list_ranges
-            .iter()
-            .any(|range| block_start >= range.start && block_end <= range.end)
-    {
-        ranges.push((block_start..block_end, block_text.trim_end().to_string()));
+/// Returns the byte range (within the full buffer) and display text for the
+/// raw list marker on a given line, or `None` if the line is not a list item.
+///
+/// The fold range covers the raw marker characters only (e.g. `-` or `1.`),
+/// NOT the mandatory space that follows. That space remains visible in the
+/// buffer so the editor provides natural glyph spacing between the rendered
+/// placeholder and the item content.
+fn list_marker_fold_range(
+    line: &str,
+    line_start: usize,
+) -> Option<(Range<usize>, String)> {
+    let indent_bytes = line.len() - line.trim_start().len();
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
     }
-    block_text.clear();
+
+    let first_char = trimmed.chars().next()?;
+
+    let (raw_marker_len, display) = if matches!(first_char, '-' | '+' | '*') {
+        // Unordered: marker is the single character, followed by whitespace.
+        let rest = &trimmed[first_char.len_utf8()..];
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        (first_char.len_utf8(), "•".to_string())
+    } else if first_char.is_ascii_digit() {
+        // Ordered: one or more digits followed by `.` or `)` then whitespace.
+        let dot_pos = trimmed
+            .char_indices()
+            .find_map(|(i, c)| matches!(c, '.' | ')').then_some((i, c)))?;
+        let number = &trimmed[..dot_pos.0];
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let marker_end = dot_pos.0 + dot_pos.1.len_utf8();
+        let rest = &trimmed[marker_end..];
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let display = format!("{number}.");
+        (marker_end, display)
+    } else {
+        return None;
+    };
+
+    let marker_start = line_start + indent_bytes;
+    let marker_end = marker_start + raw_marker_len;
+    Some((marker_start..marker_end, display))
 }
 
 fn remove_inline_nodes_inside_fenced_code(
@@ -1567,6 +1436,8 @@ fn remove_inline_nodes_inside_fenced_code(
                     | MarkdownNodeData::InlineCode
                     | MarkdownNodeData::Link
                     | MarkdownNodeData::Image { .. }
+                    | MarkdownNodeData::Checkbox
+                    | MarkdownNodeData::ListMarker { .. }
             ) {
                 return true;
             }
@@ -2529,34 +2400,35 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_list_items() {
+    fn test_list_marker_fold_range() {
+        // Unordered bullet at start of line: fold just the `-`, space stays.
         assert_eq!(
-            parse_markdown_list_items("- one\n  - [x] nested\n2. two"),
-            vec![
-                RenderedMarkdownListItem {
-                    indent_columns: 0,
-                    marker: "•".to_string(),
-                    text: "one".to_string(),
-                },
-                RenderedMarkdownListItem {
-                    indent_columns: 2,
-                    marker: "[x]".to_string(),
-                    text: "nested".to_string(),
-                },
-                RenderedMarkdownListItem {
-                    indent_columns: 0,
-                    marker: "2.".to_string(),
-                    text: "two".to_string(),
-                },
-            ]
+            list_marker_fold_range("- item", 0),
+            Some((0..1, "•".to_string()))
         );
-    }
-
-    #[test]
-    fn test_text_list_node_detection() {
-        let text = "- one\n- two\n\nSome other text";
-        let ranges = text_list_ranges(text, &[], &[]);
-        assert_eq!(ranges, vec![(0..12, "- one\n- two".to_string())]);
+        // Indented bullet: fold starts after indent.
+        assert_eq!(
+            list_marker_fold_range("  - item", 0),
+            Some((2..3, "•".to_string()))
+        );
+        // Ordered marker: fold covers digits + period.
+        assert_eq!(
+            list_marker_fold_range("1. item", 0),
+            Some((0..2, "1.".to_string()))
+        );
+        assert_eq!(
+            list_marker_fold_range("10. item", 5),
+            Some((5..8, "10.".to_string()))
+        );
+        // Checkbox item: bullet fold still emits `•` for the `-` part.
+        assert_eq!(
+            list_marker_fold_range("- [ ] task", 0),
+            Some((0..1, "•".to_string()))
+        );
+        // Plain text line: no fold.
+        assert_eq!(list_marker_fold_range("plain text", 0), None);
+        // Marker without following space: no fold.
+        assert_eq!(list_marker_fold_range("-item", 0), None);
     }
 
     #[test]

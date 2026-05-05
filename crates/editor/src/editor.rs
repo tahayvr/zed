@@ -4504,6 +4504,13 @@ impl Editor {
     ) {
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
 
+        // Re-clip the position against the current display map. The `position` comes from
+        // `PositionMap::point_for_position`, which uses the snapshot from the last paint. If
+        // blocks were added or removed (e.g., by `markdown_live_preview::sync`) between that
+        // paint and this event handler, the stale display point can map to an out-of-bounds
+        // buffer column in the now-current snapshot.
+        let position = display_map.clip_point(position, Bias::Left);
+
         if self.columnar_selection_state.is_some() {
             self.select_columns(position, goal_column, &display_map, window, cx);
         } else if let Some(mut pending) = self.selections.pending_anchor().cloned() {

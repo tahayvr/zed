@@ -37896,7 +37896,7 @@ async fn test_markdown_live_preview_replaces_html_block_when_cursor_away(
 }
 
 #[gpui::test]
-async fn test_markdown_live_preview_replaces_list_when_cursor_away(cx: &mut TestAppContext) {
+ async fn test_markdown_live_preview_replaces_list_when_cursor_away(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {
         settings.markdown = Some(settings::MarkdownContent {
@@ -37921,15 +37921,14 @@ async fn test_markdown_live_preview_replaces_list_when_cursor_away(cx: &mut Test
     "});
     cx.run_until_parked();
 
-    let block_count = cx.update_editor(|editor, window, cx| {
+    // Lists now use inline folds on the marker characters rather than Replace blocks.
+    let fold_count = cx.update_editor(|editor, window, cx| {
         let snapshot = editor.snapshot(window, cx);
-        snapshot
-            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
-            .count()
+        snapshot.folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len()).count()
     });
     assert!(
-        block_count >= 1,
-        "expected a replacement block for the list preview"
+        fold_count >= 2,
+        "expected at least 2 folds for list markers, got {fold_count}"
     );
 }
 
@@ -37961,15 +37960,15 @@ async fn test_markdown_live_preview_replaces_task_list_when_cursor_away(
     "});
     cx.run_until_parked();
 
-    let block_count = cx.update_editor(|editor, window, cx| {
+    // Task list items get an inline fold on the marker (`-`) and another on
+    // the checkbox (`[ ]`/`[x]`). Expect at least 4 folds for two items.
+    let fold_count = cx.update_editor(|editor, window, cx| {
         let snapshot = editor.snapshot(window, cx);
-        snapshot
-            .blocks_in_range(DisplayRow(0)..snapshot.max_point().row())
-            .count()
+        snapshot.folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len()).count()
     });
     assert!(
-        block_count >= 1,
-        "expected a replacement block for the task list preview"
+        fold_count >= 4,
+        "expected at least 4 folds for task list (bullet + checkbox per item), got {fold_count}"
     );
 }
 
@@ -38116,10 +38115,14 @@ async fn test_markdown_live_preview_replaces_inline_markdown_list_when_cursor_aw
     "});
     cx.run_until_parked();
 
-    let block_count = cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    // List marker folds replace the `-` characters.
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot.folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len()).count()
+    });
     assert!(
-        block_count >= 1,
-        "expected a replacement block for the inline-markup list preview"
+        fold_count >= 2,
+        "expected at least 2 folds for list markers, got {fold_count}"
     );
 }
 
@@ -38365,7 +38368,8 @@ async fn test_markdown_live_preview_reveals_frontmatter_when_cursor_enters(
 async fn test_markdown_live_preview_task_list_renders_checkbox_glyphs(
     cx: &mut TestAppContext,
 ) {
-    // Verifies that task list items render ☐/☑ instead of plain "[ ]"/"[x]".
+    // Verifies that task list items get folds on both the bullet marker and the
+    // checkbox token, and that the checkbox token text is correctly classified.
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {
         settings.markdown = Some(settings::MarkdownContent {
@@ -38383,7 +38387,7 @@ async fn test_markdown_live_preview_task_list_renders_checkbox_glyphs(
         buffer.set_language(Some(markdown_lang()), cx);
     });
 
-    // Cursor on a different line so the list gets a Replace block.
+    // Cursor on a different line so the list markers get folded.
     cx.set_state(indoc! {"
         - [ ] Buy milk
         - [x] Write tests
@@ -38392,20 +38396,20 @@ async fn test_markdown_live_preview_task_list_renders_checkbox_glyphs(
     "});
     cx.run_until_parked();
 
-    // Verify a Replace block exists (the list preview).
-    let block_count =
-        cx.update_editor(|editor, _, _| crate::markdown_live_preview::block_ids(editor).len());
+    // Each task list item should have a fold for the `-` bullet and another for
+    // the `[ ]`/`[x]` checkbox token: 2 items × 2 folds = 4.
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        snapshot.folds_in_range(MultiBufferOffset(0)..snapshot.buffer_snapshot().len()).count()
+    });
     assert!(
-        block_count >= 1,
-        "expected a Replace block for the task list, got {block_count}"
+        fold_count >= 4,
+        "expected at least 4 folds for task list markers + checkboxes, got {fold_count}"
     );
 
-    // The parse_markdown_list_item_line function returns "[ ]" and "[x]" as
-    // marker strings. render_list_item then maps them to "☐" and "☑".
-    // Verify the mapping at the data level via parse_markdown_list_items.
-    let items = markdown::parse_markdown_list_items("- [ ] Buy milk\n- [x] Write tests");
-    assert_eq!(items[0].marker, "[ ]");
-    assert_eq!(items[1].marker, "[x]");
-    // The visual rendering (☐/☑) is confirmed by the render function; the
-    // above confirms the input data is correctly classified by the parser.
+    // The parse_markdown_list_item_line function correctly classifies the markers.
+    let item_unchecked = markdown::parse_markdown_list_item_line("- [ ] Buy milk").unwrap();
+    let item_checked = markdown::parse_markdown_list_item_line("- [x] Write tests").unwrap();
+    assert_eq!(item_unchecked.marker, "[ ]");
+    assert_eq!(item_checked.marker, "[x]");
 }
