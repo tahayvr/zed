@@ -606,6 +606,42 @@ fn render_markdown_live_preview_block(
                                     true
                                 }
                             })
+                            .on_checkbox_toggle({
+                                let editor = editor.clone();
+                                let source_start = block.source_range.start;
+                                move |source_range, new_checked, _window, cx| {
+                                    let Some(editor) = editor.upgrade() else {
+                                        return;
+                                    };
+
+                                    editor.update(cx, |editor, cx| {
+                                        let source_range = source_start + source_range.start
+                                            ..source_start + source_range.end;
+                                        let existing_marker: String = editor
+                                            .buffer()
+                                            .read(cx)
+                                            .snapshot(cx)
+                                            .text_for_range(
+                                                MultiBufferOffset(source_range.start)
+                                                    ..MultiBufferOffset(source_range.end),
+                                            )
+                                            .collect();
+                                        let replacement = if new_checked { "[x]" } else { "[ ]" };
+
+                                        if matches!(existing_marker.as_str(), "[ ]" | "[x]" | "[X]")
+                                        {
+                                            editor.edit(
+                                                [(
+                                                    MultiBufferOffset(source_range.start)
+                                                        ..MultiBufferOffset(source_range.end),
+                                                    replacement,
+                                                )],
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                }
+                            })
                     }),
             )
             .into_any_element()

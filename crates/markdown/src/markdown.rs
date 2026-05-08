@@ -1279,8 +1279,9 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1().line_height(rems(1.3))
                 })
+                .gap_1()
                 .h_flex()
                 .items_start()
                 .child(bullet),
@@ -1882,7 +1883,8 @@ impl Element for MarkdownElement {
                                     if let Some(on_toggle) = self.on_checkbox_toggle.clone() {
                                         let task_source_range = task_range.clone();
                                         checkbox
-                                            .on_click(move |_state, window, cx| {
+                                            .on_click_ext(move |_state, _event, window, cx| {
+                                                cx.stop_propagation();
                                                 on_toggle(
                                                     task_source_range.clone(),
                                                     !checked,
@@ -2735,7 +2737,8 @@ impl MarkdownElementBuilder {
 
         let checkbox = if let Some(on_toggle) = on_toggle {
             checkbox
-                .on_click(move |_state, window, cx| {
+                .on_click_ext(move |_state, _event, window, cx| {
+                    cx.stop_propagation();
                     on_toggle(marker_source.clone(), !checked, window, cx);
                 })
                 .into_any_element()
