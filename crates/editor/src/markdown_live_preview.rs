@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use gpui::{App, ClickEvent, ElementId, Focusable, MouseButton, WeakEntity};
 use markdown::parser::{
     MarkdownLivePreviewBlock, MarkdownLivePreviewBlockKind, markdown_live_preview_blocks,
@@ -26,6 +26,8 @@ pub(crate) struct MarkdownLivePreviewState {
 
 struct MarkdownLivePreviewBlockState {
     block_id: CustomBlockId,
+    source_range: Range<usize>,
+    source: String,
 }
 
 impl Editor {
@@ -34,9 +36,8 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.remove_markdown_live_preview_blocks(cx);
-
         if !self.should_render_markdown_live_preview(cx) {
+            self.remove_markdown_live_preview_blocks(cx);
             return;
         }
 
@@ -45,8 +46,23 @@ impl Editor {
         let active_rows = self.active_markdown_live_preview_rows(cx);
         let editor = cx.entity().downgrade();
         let blocks = markdown_live_preview_blocks(&text);
+        let mut old_blocks = self
+            .markdown_live_preview
+            .take()
+            .unwrap_or_default()
+            .blocks
+            .into_iter()
+            .map(|block| {
+                (
+                    live_preview_block_key(&block.source_range, &block.source),
+                    block,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut retained_blocks = Vec::new();
 
         let mut block_properties = Vec::new();
+        let mut new_block_metadata = Vec::new();
         for block in blocks {
             let start = snapshot.offset_to_point(MultiBufferOffset(block.source_range.start));
             let end = snapshot.offset_to_point(MultiBufferOffset(block.source_range.end));
@@ -54,8 +70,16 @@ impl Editor {
                 continue;
             }
 
+            let source = block.source.to_string();
+            let key = live_preview_block_key(&block.source_range, &source);
+            if let Some(old_block) = old_blocks.remove(&key) {
+                retained_blocks.push(old_block);
+                continue;
+            }
+
             let start_anchor = snapshot.anchor_before(start);
             let end_anchor = snapshot.anchor_after(end);
+            let source_range = block.source_range.clone();
             let markdown = cx.new(|cx| {
                 Markdown::new_with_options(
                     block.source.clone(),
@@ -78,20 +102,36 @@ impl Editor {
                 render: render_markdown_live_preview_block(block, markdown, editor.clone(), height),
                 priority: 0,
             });
+            new_block_metadata.push((source_range, source));
         }
 
-        if block_properties.is_empty() {
+        let blocks_to_remove = old_blocks
+            .into_values()
+            .map(|block| block.block_id)
+            .collect::<HashSet<_>>();
+        if !blocks_to_remove.is_empty() {
+            self.remove_blocks(blocks_to_remove, None, cx);
+        }
+
+        if !block_properties.is_empty() {
+            let block_ids = self.insert_blocks(block_properties, None, cx);
+            retained_blocks.extend(block_ids.into_iter().zip(new_block_metadata).map(
+                |(block_id, (source_range, source))| MarkdownLivePreviewBlockState {
+                    block_id,
+                    source_range,
+                    source,
+                },
+            ));
+        }
+
+        if retained_blocks.is_empty() {
             return;
         }
 
-        let block_ids = self.insert_blocks(block_properties, None, cx);
         let state = self
             .markdown_live_preview
             .get_or_insert_with(Default::default);
-        state.blocks = block_ids
-            .into_iter()
-            .map(|block_id| MarkdownLivePreviewBlockState { block_id })
-            .collect();
+        state.blocks = retained_blocks;
     }
 
     pub(crate) fn remove_markdown_live_preview_blocks(&mut self, cx: &mut Context<Self>) {
@@ -146,6 +186,10 @@ fn rows_intersect(rows: Range<u32>, active_rows: &[Range<u32>]) -> bool {
         .any(|active| rows.start < active.end && active.start < rows.end)
 }
 
+fn live_preview_block_key(source_range: &Range<usize>, source: &str) -> (usize, usize, String) {
+    (source_range.start, source_range.end, source.to_string())
+}
+
 fn block_height(block: &MarkdownLivePreviewBlock) -> u32 {
     let source_lines = block.source.lines().count().max(1) as u32;
     match block.kind {
@@ -170,12 +214,16 @@ fn render_markdown_live_preview_block(
     Arc::new(move |cx| {
         let editor_for_click = editor.clone();
         let source_range_for_click = block.source_range.clone();
+        let right_padding = cx.margins.right + cx.em_width * 4.;
+        let content_width = (cx.max_width - right_padding).max(cx.em_width);
         div()
             .id(element_id.clone())
-            .w_full()
+            .w(cx.max_width)
+            .max_w_full()
+            .min_w_0()
             .h((height as f32) * cx.line_height)
-            .pr_3()
             .py_0p5()
+            .overflow_x_hidden()
             .overflow_hidden()
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -184,7 +232,6 @@ fn render_markdown_live_preview_block(
                     return;
                 };
                 editor.update(cx, |editor, cx| {
-                    editor.remove_markdown_live_preview_blocks(cx);
                     let snapshot = editor.buffer.read(cx).snapshot(cx);
                     let point =
                         snapshot.offset_to_point(MultiBufferOffset(source_range_for_click.start));
@@ -199,7 +246,7 @@ fn render_markdown_live_preview_block(
                     window.focus(&editor.focus_handle(cx), cx);
                 });
             })
-            .child({
+            .child(div().w(content_width).min_w_0().overflow_x_hidden().child({
                 let mut style = MarkdownStyle::themed(MarkdownFont::Preview, cx.window, cx.app);
                 style.container_style.margin = gpui::EdgesRefinement::default();
                 style.container_style.padding = gpui::EdgesRefinement::default();
@@ -219,7 +266,6 @@ fn render_markdown_live_preview_block(
                                 return false;
                             };
                             editor.update(cx, |editor, cx| {
-                                editor.remove_markdown_live_preview_blocks(cx);
                                 let snapshot = editor.buffer.read(cx).snapshot(cx);
                                 let point = snapshot.offset_to_point(MultiBufferOffset(
                                     source_start + source_offset,
@@ -235,7 +281,7 @@ fn render_markdown_live_preview_block(
                             true
                         }
                     })
-            })
+            }))
             .into_any_element()
     })
 }
