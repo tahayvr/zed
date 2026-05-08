@@ -543,6 +543,7 @@ pub struct MarkdownLivePreviewBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownLivePreviewBlockKind {
     Paragraph,
+    Image,
     Heading(u8),
     List,
     Item,
@@ -576,15 +577,16 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
                         .max()
                         .unwrap_or(range.end),
                 );
-                if source_start >= source_end {
+                let source_range = trim_live_preview_source_range(text, source_start..source_end);
+                if source_range.start >= source_range.end {
                     continue;
                 }
 
                 let kind = live_preview_block_kind(events);
                 let display_text = live_preview_block_text(text, events, kind);
                 blocks.push(MarkdownLivePreviewBlock {
-                    source_range: source_start..source_end,
-                    source: SharedString::from(&text[source_start..source_end]),
+                    source_range: source_range.clone(),
+                    source: SharedString::from(&text[source_range]),
                     display_text: SharedString::from(display_text),
                     kind,
                 });
@@ -596,9 +598,43 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
     blocks
 }
 
+fn trim_live_preview_source_range(source: &str, range: Range<usize>) -> Range<usize> {
+    let mut start = range.start;
+    let mut end = range.end;
+
+    while start < end {
+        let Some(character) = source[start..end].chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        start += character.len_utf8();
+    }
+
+    while start < end {
+        let Some(character) = source[start..end].chars().next_back() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+
+    start..end
+}
+
 fn live_preview_block_kind(
     events: &[(Range<usize>, MarkdownEvent)],
 ) -> MarkdownLivePreviewBlockKind {
+    if events
+        .iter()
+        .any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Image { .. })))
+    {
+        return MarkdownLivePreviewBlockKind::Image;
+    }
+
     for (_, event) in events {
         match event {
             MarkdownEvent::Rule => return MarkdownLivePreviewBlockKind::Rule,
@@ -1480,9 +1516,11 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Heading(1));
         assert_eq!(blocks[0].display_text, "Heading");
-        assert_eq!(blocks[0].source_range, 0..10);
+        assert_eq!(blocks[0].source_range, 0..9);
         assert_eq!(blocks[1].kind, MarkdownLivePreviewBlockKind::Paragraph);
         assert_eq!(blocks[1].display_text, "This is strong and code.");
+        assert!(!blocks[0].source.ends_with('\n'));
+        assert!(!blocks[1].source.ends_with('\n'));
     }
 
     #[test]
@@ -1492,5 +1530,25 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::CodeBlock);
         assert_eq!(blocks[0].display_text, "let value = 1;");
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_classify_images() {
+        let blocks = markdown_live_preview_blocks("![Alt text](image.png \"Title\")\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Image);
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_preserve_gfm_alert_body() {
+        let blocks =
+            markdown_live_preview_blocks("> [!NOTE]\n> A note.\n\n> [!WARNING]\n> A warning.\n");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::BlockQuote);
+        assert_eq!(blocks[0].source, "> [!NOTE]\n> A note.");
+        assert_eq!(blocks[1].kind, MarkdownLivePreviewBlockKind::BlockQuote);
+        assert_eq!(blocks[1].source, "> [!WARNING]\n> A warning.");
     }
 }
