@@ -65,6 +65,7 @@ pub struct EditorSettings {
     pub completion_detail_alignment: CompletionDetailAlignment,
     pub diff_view_style: DiffViewStyle,
     pub minimum_split_diff_width: f32,
+    pub markdown: Markdown,
 }
 #[derive(Debug, Clone)]
 pub struct Jupyter {
@@ -183,6 +184,11 @@ pub struct SearchSettings {
     pub center_on_match: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct Markdown {
+    pub live_preview: bool,
+}
+
 impl EditorSettings {
     pub fn jupyter_enabled(cx: &App) -> bool {
         EditorSettings::get_global(cx).jupyter.enabled
@@ -200,6 +206,7 @@ impl Settings for EditorSettings {
         let search = editor.search.unwrap();
         let drag_and_drop_selection = editor.drag_and_drop_selection.unwrap();
         let sticky_scroll = editor.sticky_scroll.unwrap();
+        let markdown = editor.markdown.unwrap_or_default();
         Self {
             cursor_blink: editor.cursor_blink.unwrap(),
             cursor_shape: editor.cursor_shape.map(Into::into),
@@ -306,6 +313,9 @@ impl Settings for EditorSettings {
             completion_detail_alignment: editor.completion_detail_alignment.unwrap(),
             diff_view_style: editor.diff_view_style.unwrap(),
             minimum_split_diff_width: editor.minimum_split_diff_width.unwrap(),
+            markdown: Markdown {
+                live_preview: markdown.live_preview.unwrap_or(false),
+            },
         }
     }
 }
