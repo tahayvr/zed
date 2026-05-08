@@ -2852,7 +2852,7 @@ fn editor_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Markdown"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Live Preview",
-                description: "Hide syntax markers when the cursor is not on them and render rich text styling (bold, italic, heading colors) inline in the editor.",
+                description: "Render inactive Markdown blocks as rich preview content while keeping the active block editable.",
                 field: Box::new(SettingField {
                     json_path: Some("editor.markdown.live_preview"),
                     pick: |settings_content| {

@@ -14,7 +14,6 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
 };
-use project::image_store::ImageItem;
 use settings::Settings;
 use text::Point;
 use ui::{Context, Window, div, prelude::*};
@@ -23,6 +22,9 @@ use crate::{
     BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, Editor, EditorSettings,
     MultiBufferOffset, RenderBlock, SelectionEffects,
 };
+
+const MIN_IMAGE_BLOCK_LINES: u32 = 4;
+const IMAGE_FALLBACK_LINES: u32 = 24;
 
 #[derive(Default)]
 pub(crate) struct MarkdownLivePreviewState {
@@ -52,8 +54,9 @@ impl Default for MarkdownLivePreviewImageLayout {
 
 struct MarkdownLivePreviewBlockState {
     block_id: CustomBlockId,
-    source_range: Range<usize>,
+    replacement_range: Range<usize>,
     source: String,
+    image_destination: Option<String>,
 }
 
 impl Editor {
@@ -99,7 +102,7 @@ impl Editor {
             .into_iter()
             .map(|block| {
                 (
-                    live_preview_block_key(&block.source_range, &block.source),
+                    live_preview_block_key(&block.replacement_range, &block.source),
                     block,
                 )
             })
@@ -109,14 +112,14 @@ impl Editor {
         let mut block_properties = Vec::new();
         let mut new_block_metadata = Vec::new();
         for block in blocks {
-            let start = snapshot.offset_to_point(MultiBufferOffset(block.source_range.start));
-            let end = snapshot.offset_to_point(MultiBufferOffset(block.source_range.end));
+            let start = snapshot.offset_to_point(MultiBufferOffset(block.replacement_range.start));
+            let end = snapshot.offset_to_point(MultiBufferOffset(block.replacement_range.end));
             if start == end || rows_intersect(start.row..end.row.saturating_add(1), &active_rows) {
                 continue;
             }
 
             let source = block.source.to_string();
-            let key = live_preview_block_key(&block.source_range, &source);
+            let key = live_preview_block_key(&block.replacement_range, &source);
             if let Some(old_block) = old_blocks.remove(&key) {
                 retained_blocks.push(old_block);
                 continue;
@@ -124,7 +127,7 @@ impl Editor {
 
             let start_anchor = snapshot.anchor_before(start);
             let end_anchor = snapshot.anchor_after(end);
-            let source_range = block.source_range.clone();
+            let replacement_range = block.replacement_range.clone();
             let markdown = cx.new(|cx| {
                 Markdown::new_with_options(
                     block.source.clone(),
@@ -139,7 +142,7 @@ impl Editor {
                     cx,
                 )
             });
-            let image_url = image_url_for_block(&block);
+            let image_url = image_dimension_url_for_block(&block, base_directory.as_deref());
             let height = block_height(
                 &block,
                 base_directory.as_deref(),
@@ -148,6 +151,7 @@ impl Editor {
                     .as_deref()
                     .and_then(|url| image_dimensions_by_url.get(url).copied()),
             );
+            let image_destination = block.image_destination.as_ref().map(ToString::to_string);
             block_properties.push(BlockProperties {
                 placement: BlockPlacement::Replace(start_anchor..=end_anchor),
                 height: Some(height),
@@ -157,12 +161,13 @@ impl Editor {
                     markdown,
                     editor.clone(),
                     height,
+                    image_url.clone(),
                     base_directory.clone(),
                     image_cache.clone(),
                 ),
                 priority: 0,
             });
-            new_block_metadata.push((source_range, source, image_url));
+            new_block_metadata.push((replacement_range, source, image_destination, image_url));
         }
 
         let blocks_to_remove = old_blocks
@@ -176,25 +181,47 @@ impl Editor {
         if !block_properties.is_empty() {
             let block_ids = self.insert_blocks(block_properties, None, cx);
             retained_blocks.extend(block_ids.into_iter().zip(new_block_metadata).map(
-                |(block_id, (source_range, source, image_url))| {
+                |(block_id, (replacement_range, source, image_destination, image_url))| {
                     if let Some(image_url) = image_url {
                         state.image_blocks_by_url.insert(image_url, block_id);
                     }
                     MarkdownLivePreviewBlockState {
                         block_id,
-                        source_range,
+                        replacement_range,
                         source,
+                        image_destination,
                     }
                 },
             ));
         }
 
         for block in &retained_blocks {
-            if let Some(image_url) = first_image_destination(&block.source)
-                && is_remote_image_url(&image_url)
+            if let Some(image_url) = block
+                .image_destination
+                .as_deref()
+                .and_then(|destination| image_dimension_url(destination, base_directory.as_deref()))
             {
                 state.image_blocks_by_url.insert(image_url, block.block_id);
             }
+        }
+
+        let image_block_heights = state
+            .image_blocks_by_url
+            .iter()
+            .filter_map(|(image_url, block_id)| {
+                state
+                    .image_dimensions_by_url
+                    .get(image_url)
+                    .map(|dimensions| {
+                        (
+                            *block_id,
+                            image_height_for_dimensions(*dimensions, image_layout),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        if !image_block_heights.is_empty() {
+            self.resize_blocks(image_block_heights, None, cx);
         }
 
         let image_urls = state
@@ -209,10 +236,14 @@ impl Editor {
                 continue;
             }
 
+            let Some(resource) = image_resource_for_dimension_url(&image_url) else {
+                state.pending_image_dimension_urls.remove(&image_url);
+                continue;
+            };
+
             state
                 ._image_dimension_tasks
                 .push(cx.spawn(async move |editor, cx| {
-                    let resource = Resource::Uri(SharedUri::from(image_url.clone()));
                     let load = cx.update(|cx| {
                         let load = AssetLogger::<ImageAssetLoader>::load(resource, cx);
                         cx.background_spawn(load)
@@ -350,21 +381,18 @@ fn block_height(
 fn image_block_height(
     block: &MarkdownLivePreviewBlock,
     base_directory: Option<&Path>,
-    image_layout: MarkdownLivePreviewImageLayout,
+    _image_layout: MarkdownLivePreviewImageLayout,
 ) -> u32 {
-    let Some(destination) = first_image_destination(&block.source) else {
-        return 24;
-    };
-    let Some(path) = resolve_markdown_live_preview_image_path(&destination, base_directory) else {
-        return 24;
-    };
-    let Ok(bytes) = std::fs::read(path) else {
-        return 24;
-    };
-    let Ok(metadata) = ImageItem::compute_metadata_from_bytes(&bytes) else {
-        return 24;
-    };
-    image_height_for_dimensions((metadata.width, metadata.height), image_layout)
+    if block
+        .image_destination
+        .as_deref()
+        .and_then(|destination| image_dimension_url(destination, base_directory))
+        .is_some()
+    {
+        IMAGE_FALLBACK_LINES
+    } else {
+        MIN_IMAGE_BLOCK_LINES
+    }
 }
 
 fn image_height_for_dimensions(
@@ -379,32 +407,35 @@ fn image_height_for_dimensions(
     let rendered_height = height as f32 * scale;
     ((rendered_height + image_layout.line_height) / image_layout.line_height)
         .ceil()
-        .max(4.) as u32
+        .max(MIN_IMAGE_BLOCK_LINES as f32) as u32
 }
 
-fn image_url_for_block(block: &MarkdownLivePreviewBlock) -> Option<String> {
-    let destination = first_image_destination(&block.source)?;
-    is_remote_image_url(&destination).then_some(destination)
+fn image_dimension_url_for_block(
+    block: &MarkdownLivePreviewBlock,
+    base_directory: Option<&Path>,
+) -> Option<String> {
+    image_dimension_url(block.image_destination.as_deref()?, base_directory)
 }
 
-fn is_remote_image_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+fn image_dimension_url(destination: &str, base_directory: Option<&Path>) -> Option<String> {
+    if destination.starts_with("data:") {
+        return None;
+    }
+
+    if destination.starts_with("http://") || destination.starts_with("https://") {
+        return Some(destination.to_string());
+    }
+
+    resolve_markdown_live_preview_image_path(destination, base_directory)
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
-fn first_image_destination(source: &str) -> Option<String> {
-    let image_start = source.find("![")?;
-    let destination_start = source[image_start..].find("](")? + image_start + 2;
-    let destination_end = source[destination_start..].find(')')? + destination_start;
-    let destination = source[destination_start..destination_end].trim();
-    let destination = destination
-        .strip_prefix('<')
-        .and_then(|destination| destination.strip_suffix('>'))
-        .unwrap_or(destination);
-    let destination = destination
-        .split_once(char::is_whitespace)
-        .map_or(destination, |(destination, _)| destination);
-
-    (!destination.is_empty()).then(|| destination.to_string())
+fn image_resource_for_dimension_url(url: &str) -> Option<Resource> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(Resource::Uri(SharedUri::from(url.to_string())))
+    } else {
+        Some(Resource::Path(Arc::from(Path::new(url))))
+    }
 }
 
 fn resolve_markdown_live_preview_image_path(
@@ -452,6 +483,7 @@ fn render_markdown_live_preview_block(
     markdown: gpui::Entity<Markdown>,
     editor: WeakEntity<Editor>,
     height: u32,
+    image_url: Option<String>,
     base_directory: Option<PathBuf>,
     image_cache: gpui::Entity<RetainAllImageCache>,
 ) -> RenderBlock {
@@ -461,6 +493,30 @@ fn render_markdown_live_preview_block(
         let source_range_for_click = block.source_range.clone();
         let right_padding = cx.margins.right + cx.em_width * 4.;
         let content_width = (cx.max_width - right_padding).max(cx.em_width);
+        let height = if matches!(block.kind, MarkdownLivePreviewBlockKind::Image) {
+            image_url
+                .as_ref()
+                .and_then(|image_url| {
+                    editor.upgrade().and_then(|editor| {
+                        editor
+                            .read(cx.app)
+                            .markdown_live_preview
+                            .as_ref()
+                            .and_then(|state| state.image_dimensions_by_url.get(image_url).copied())
+                    })
+                })
+                .map_or(height, |dimensions| {
+                    image_height_for_dimensions(
+                        dimensions,
+                        MarkdownLivePreviewImageLayout {
+                            content_width: f32::from(content_width),
+                            line_height: f32::from(cx.line_height),
+                        },
+                    )
+                })
+        } else {
+            height
+        };
         div()
             .id(element_id.clone())
             .w(cx.max_width)
@@ -502,11 +558,19 @@ fn render_markdown_live_preview_block(
                             MarkdownStyle::themed(MarkdownFont::Preview, cx.window, cx.app);
                         style.container_style.margin = gpui::EdgesRefinement::default();
                         style.container_style.padding = gpui::EdgesRefinement::default();
+                        style.heading.margin = gpui::EdgesRefinement {
+                            top: Some(gpui::Length::Definite(px(0.).into())),
+                            bottom: Some(gpui::Length::Definite(px(0.).into())),
+                            ..Default::default()
+                        };
+                        style.height_is_multiple_of_line_height = true;
+                        style.prevent_mouse_interaction = true;
+                        style.table_columns_min_size = false;
 
                         MarkdownElement::new(markdown.clone(), style)
                             .code_block_renderer(CodeBlockRenderer::Default {
                                 copy_button_visibility: CopyButtonVisibility::Hidden,
-                                border: false,
+                                border: true,
                             })
                             .image_resolver({
                                 let base_directory = base_directory.clone();

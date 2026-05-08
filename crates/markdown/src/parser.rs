@@ -535,8 +535,10 @@ pub(crate) fn parse_markdown_with_options(
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownLivePreviewBlock {
     pub source_range: Range<usize>,
+    pub replacement_range: Range<usize>,
     pub source: SharedString,
     pub display_text: SharedString,
+    pub image_destination: Option<SharedString>,
     pub kind: MarkdownLivePreviewBlockKind,
 }
 
@@ -586,12 +588,27 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
                 let display_text = live_preview_block_text(text, events, kind);
                 blocks.push(MarkdownLivePreviewBlock {
                     source_range: source_range.clone(),
+                    replacement_range: source_range.clone(),
                     source: SharedString::from(&text[source_range]),
                     display_text: SharedString::from(display_text),
+                    image_destination: live_preview_block_image_destination(events),
                     kind,
                 });
             }
             _ => {}
+        }
+    }
+
+    for ix in 0..blocks.len().saturating_sub(1) {
+        let next_start = blocks[ix + 1].source_range.start;
+        if text[blocks[ix].source_range.end..next_start]
+            .chars()
+            .all(char::is_whitespace)
+            && let Some((separator_end, _)) = text[blocks[ix].source_range.end..next_start]
+                .char_indices()
+                .next_back()
+        {
+            blocks[ix].replacement_range.end = blocks[ix].source_range.end + separator_end;
         }
     }
 
@@ -623,6 +640,15 @@ fn trim_live_preview_source_range(source: &str, range: Range<usize>) -> Range<us
     }
 
     start..end
+}
+
+fn live_preview_block_image_destination(
+    events: &[(Range<usize>, MarkdownEvent)],
+) -> Option<SharedString> {
+    events.iter().find_map(|(_, event)| match event {
+        MarkdownEvent::Start(MarkdownTag::Image { dest_url, .. }) => Some(dest_url.clone()),
+        _ => None,
+    })
 }
 
 fn live_preview_block_kind(
@@ -1517,6 +1543,7 @@ mod tests {
         assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Heading(1));
         assert_eq!(blocks[0].display_text, "Heading");
         assert_eq!(blocks[0].source_range, 0..9);
+        assert_eq!(blocks[0].replacement_range, 0..10);
         assert_eq!(blocks[1].kind, MarkdownLivePreviewBlockKind::Paragraph);
         assert_eq!(blocks[1].display_text, "This is strong and code.");
         assert!(!blocks[0].source.ends_with('\n'));
@@ -1538,6 +1565,16 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Image);
+        assert_eq!(blocks[0].image_destination.as_deref(), Some("image.png"));
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_preserve_image_destinations_with_spaces() {
+        let blocks = markdown_live_preview_blocks("![Alt text](<my image.png> \"Title\")\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Image);
+        assert_eq!(blocks[0].image_destination.as_deref(), Some("my image.png"));
     }
 
     #[test]
