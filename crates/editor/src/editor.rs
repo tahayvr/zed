@@ -34,6 +34,7 @@ pub mod items;
 mod jsx_tag_auto_close;
 mod linked_editing_ranges;
 mod lsp_ext;
+mod markdown_live_preview;
 mod mouse_context_menu;
 pub mod movement;
 mod persistence;
@@ -167,6 +168,7 @@ use lsp::{
     LanguageServerId,
 };
 use markdown::Markdown;
+use markdown_live_preview::MarkdownLivePreviewState;
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
@@ -1326,6 +1328,7 @@ pub struct Editor {
     selection_drag_state: SelectionDragState,
     colors: Option<LspColorData>,
     code_lens: Option<CodeLensState>,
+    markdown_live_preview: Option<MarkdownLivePreviewState>,
     post_scroll_update: Task<()>,
     refresh_colors_task: Task<()>,
     refresh_code_lens_task: Task<()>,
@@ -2571,6 +2574,7 @@ impl Editor {
             pull_diagnostics_task: Task::ready(()),
             colors: None,
             code_lens: None,
+            markdown_live_preview: None,
             refresh_colors_task: Task::ready(()),
             refresh_code_lens_task: Task::ready(()),
             use_document_folding_ranges: false,
@@ -2658,6 +2662,7 @@ impl Editor {
                     editor.refresh_sticky_headers(&editor.snapshot(window, cx), cx);
                 }
                 EditorEvent::Edited { .. } => {
+                    editor.reconcile_markdown_live_preview(window, cx);
                     let vim_mode = vim_mode_setting::VimModeSetting::try_get(cx)
                         .map(|vim_mode| vim_mode.0)
                         .unwrap_or(false);
@@ -2683,6 +2688,9 @@ impl Editor {
                             .change_list
                             .push_to_change_list(pop_state, new_positions);
                     }
+                }
+                EditorEvent::SelectionsChanged { .. } => {
+                    editor.reconcile_markdown_live_preview(window, cx);
                 }
                 _ => (),
             },
@@ -20507,6 +20515,7 @@ impl Editor {
                 }
 
                 cx.emit(EditorEvent::BufferEdited);
+                self.reconcile_markdown_live_preview(window, cx);
                 cx.emit(SearchEvent::MatchesInvalidated);
 
                 let Some(project) = &self.project else { return };
@@ -20605,6 +20614,7 @@ impl Editor {
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
+                self.reconcile_markdown_live_preview(window, cx);
                 cx.notify();
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
@@ -20730,6 +20740,7 @@ impl Editor {
         self.update_edit_prediction_settings(cx);
         self.refresh_edit_prediction(true, false, window, cx);
         self.refresh_inline_values(cx);
+        self.reconcile_markdown_live_preview(window, cx);
 
         let old_cursor_shape = self.cursor_shape;
         let old_show_breadcrumbs = self.show_breadcrumbs;

@@ -532,6 +532,149 @@ pub(crate) fn parse_markdown_with_options(
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownLivePreviewBlock {
+    pub source_range: Range<usize>,
+    pub source: SharedString,
+    pub display_text: SharedString,
+    pub kind: MarkdownLivePreviewBlockKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownLivePreviewBlockKind {
+    Paragraph,
+    Heading(u8),
+    List,
+    Item,
+    BlockQuote,
+    CodeBlock,
+    Table,
+    Rule,
+    Other,
+}
+
+pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock> {
+    let parsed = parse_markdown_with_options(text, false, false);
+    let mut blocks = Vec::new();
+    let mut block_start_event_index = None;
+
+    for (event_ix, (range, event)) in parsed.events.iter().enumerate() {
+        match event {
+            MarkdownEvent::RootStart => block_start_event_index = Some(event_ix + 1),
+            MarkdownEvent::RootEnd(_) => {
+                let Some(start_event_index) = block_start_event_index.take() else {
+                    continue;
+                };
+                let events = &parsed.events[start_event_index..event_ix];
+                let Some(source_start) = events.iter().map(|(range, _)| range.start).min() else {
+                    continue;
+                };
+                let source_end = range.end.max(
+                    events
+                        .iter()
+                        .map(|(range, _)| range.end)
+                        .max()
+                        .unwrap_or(range.end),
+                );
+                if source_start >= source_end {
+                    continue;
+                }
+
+                let kind = live_preview_block_kind(events);
+                let display_text = live_preview_block_text(text, events, kind);
+                blocks.push(MarkdownLivePreviewBlock {
+                    source_range: source_start..source_end,
+                    source: SharedString::from(&text[source_start..source_end]),
+                    display_text: SharedString::from(display_text),
+                    kind,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    blocks
+}
+
+fn live_preview_block_kind(
+    events: &[(Range<usize>, MarkdownEvent)],
+) -> MarkdownLivePreviewBlockKind {
+    for (_, event) in events {
+        match event {
+            MarkdownEvent::Rule => return MarkdownLivePreviewBlockKind::Rule,
+            MarkdownEvent::Start(MarkdownTag::Paragraph) => {
+                return MarkdownLivePreviewBlockKind::Paragraph;
+            }
+            MarkdownEvent::Start(MarkdownTag::Heading { level, .. }) => {
+                return MarkdownLivePreviewBlockKind::Heading(match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                });
+            }
+            MarkdownEvent::Start(MarkdownTag::List(_)) => {
+                return MarkdownLivePreviewBlockKind::List;
+            }
+            MarkdownEvent::Start(MarkdownTag::Item) => return MarkdownLivePreviewBlockKind::Item,
+            MarkdownEvent::Start(MarkdownTag::BlockQuote(_)) => {
+                return MarkdownLivePreviewBlockKind::BlockQuote;
+            }
+            MarkdownEvent::Start(MarkdownTag::CodeBlock { .. }) => {
+                return MarkdownLivePreviewBlockKind::CodeBlock;
+            }
+            MarkdownEvent::Start(MarkdownTag::Table(_)) => {
+                return MarkdownLivePreviewBlockKind::Table;
+            }
+            _ => {}
+        }
+    }
+
+    MarkdownLivePreviewBlockKind::Other
+}
+
+fn live_preview_block_text(
+    source: &str,
+    events: &[(Range<usize>, MarkdownEvent)],
+    kind: MarkdownLivePreviewBlockKind,
+) -> String {
+    if let Some((_, MarkdownEvent::Start(MarkdownTag::CodeBlock { metadata, .. }))) = events
+        .iter()
+        .find(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::CodeBlock { .. })))
+    {
+        return source[metadata.content_range.clone()]
+            .trim_end_matches('\n')
+            .to_string();
+    }
+
+    let mut text = String::new();
+    for (range, event) in events {
+        match event {
+            MarkdownEvent::Text | MarkdownEvent::Code => text.push_str(&source[range.clone()]),
+            MarkdownEvent::SubstitutedText(substituted) => text.push_str(substituted),
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => text.push('\n'),
+            MarkdownEvent::TaskListMarker(checked) => {
+                text.push_str(if *checked { "[x] " } else { "[ ] " });
+            }
+            MarkdownEvent::Rule => text.push_str("---"),
+            _ => {}
+        }
+    }
+
+    match kind {
+        MarkdownLivePreviewBlockKind::List | MarkdownLivePreviewBlockKind::Item => text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => text.trim().to_string(),
+    }
+}
+
 fn build_footnote_definitions(
     events: &[(Range<usize>, MarkdownEvent)],
 ) -> HashMap<SharedString, usize> {
@@ -1328,5 +1471,26 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_extract_display_text() {
+        let blocks = markdown_live_preview_blocks("# Heading\n\nThis is **strong** and `code`.\n");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Heading(1));
+        assert_eq!(blocks[0].display_text, "Heading");
+        assert_eq!(blocks[0].source_range, 0..10);
+        assert_eq!(blocks[1].kind, MarkdownLivePreviewBlockKind::Paragraph);
+        assert_eq!(blocks[1].display_text, "This is strong and code.");
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_preserve_code_content() {
+        let blocks = markdown_live_preview_blocks("```rust\nlet value = 1;\n```\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::CodeBlock);
+        assert_eq!(blocks[0].display_text, "let value = 1;");
     }
 }
