@@ -364,7 +364,7 @@ fn block_height(
     match block.kind {
         MarkdownLivePreviewBlockKind::Heading(1) => 2,
         MarkdownLivePreviewBlockKind::Heading(2) | MarkdownLivePreviewBlockKind::Heading(3) => 2,
-        MarkdownLivePreviewBlockKind::Heading(_) => 1,
+        MarkdownLivePreviewBlockKind::Heading(_) => 2,
         MarkdownLivePreviewBlockKind::Image => image_dimensions.map_or_else(
             || image_block_height(block, base_directory, image_layout),
             |dimensions| image_height_for_dimensions(dimensions, image_layout),
@@ -523,7 +523,6 @@ fn render_markdown_live_preview_block(
             .max_w_full()
             .min_w_0()
             .h((height as f32) * cx.line_height)
-            .py_0p5()
             .overflow_x_hidden()
             .overflow_hidden()
             .cursor_pointer()
@@ -558,11 +557,6 @@ fn render_markdown_live_preview_block(
                             MarkdownStyle::themed(MarkdownFont::Preview, cx.window, cx.app);
                         style.container_style.margin = gpui::EdgesRefinement::default();
                         style.container_style.padding = gpui::EdgesRefinement::default();
-                        style.heading.margin = gpui::EdgesRefinement {
-                            top: Some(gpui::Length::Definite(px(0.).into())),
-                            bottom: Some(gpui::Length::Definite(px(0.).into())),
-                            ..Default::default()
-                        };
                         style.height_is_multiple_of_line_height = true;
                         style.prevent_mouse_interaction = true;
                         style.table_columns_min_size = false;

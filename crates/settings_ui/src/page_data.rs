@@ -2852,7 +2852,7 @@ fn editor_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Markdown"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Live Preview",
-                description: "Render inactive Markdown blocks as rich preview content while keeping the active block editable.",
+                description: "Render Markdown files as preview content.",
                 field: Box::new(SettingField {
                     json_path: Some("editor.markdown.live_preview"),
                     pick: |settings_content| {
