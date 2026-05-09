@@ -371,10 +371,18 @@ fn block_height(
         ),
         MarkdownLivePreviewBlockKind::Paragraph => source_lines,
         MarkdownLivePreviewBlockKind::BlockQuote => source_lines.max(2),
-        MarkdownLivePreviewBlockKind::CodeBlock => source_lines.max(2),
+        MarkdownLivePreviewBlockKind::CodeBlock { .. } => code_block_height(block, source_lines),
         MarkdownLivePreviewBlockKind::Table => source_lines.saturating_add(1).max(3),
         MarkdownLivePreviewBlockKind::Rule => 1,
         _ => source_lines.max(1),
+    }
+}
+
+fn code_block_height(block: &MarkdownLivePreviewBlock, source_lines: u32) -> u32 {
+    if block.kind.is_indented_code_block() {
+        source_lines.saturating_add(2).max(3)
+    } else {
+        source_lines.max(2)
     }
 }
 
@@ -523,6 +531,7 @@ fn render_markdown_live_preview_block(
             .max_w_full()
             .min_w_0()
             .h((height as f32) * cx.line_height)
+            .bg(cx.editor_style.background)
             .overflow_x_hidden()
             .overflow_hidden()
             .cursor_pointer()

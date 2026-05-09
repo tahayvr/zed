@@ -550,7 +550,7 @@ pub enum MarkdownLivePreviewBlockKind {
     List,
     Item,
     BlockQuote,
-    CodeBlock,
+    CodeBlock { is_indented: bool },
     Table,
     Rule,
     Other,
@@ -579,12 +579,21 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
                         .max()
                         .unwrap_or(range.end),
                 );
-                let source_range = trim_live_preview_source_range(text, source_start..source_end);
+                let kind = live_preview_block_kind(events);
+                let source_start = if kind.is_code_block() {
+                    live_preview_line_start(text, source_start)
+                } else {
+                    source_start
+                };
+                let source_range = trim_live_preview_source_range(
+                    text,
+                    source_start..source_end,
+                    !kind.is_code_block(),
+                );
                 if source_range.start >= source_range.end {
                     continue;
                 }
 
-                let kind = live_preview_block_kind(events);
                 let display_text = live_preview_block_text(text, events, kind);
                 blocks.push(MarkdownLivePreviewBlock {
                     source_range: source_range.clone(),
@@ -615,18 +624,40 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
     blocks
 }
 
-fn trim_live_preview_source_range(source: &str, range: Range<usize>) -> Range<usize> {
+impl MarkdownLivePreviewBlockKind {
+    pub fn is_code_block(self) -> bool {
+        matches!(self, Self::CodeBlock { .. })
+    }
+
+    pub fn is_indented_code_block(self) -> bool {
+        matches!(self, Self::CodeBlock { is_indented: true })
+    }
+}
+
+fn live_preview_line_start(source: &str, offset: usize) -> usize {
+    source[..offset]
+        .rfind('\n')
+        .map_or(0, |newline_ix| newline_ix + 1)
+}
+
+fn trim_live_preview_source_range(
+    source: &str,
+    range: Range<usize>,
+    trim_leading_whitespace: bool,
+) -> Range<usize> {
     let mut start = range.start;
     let mut end = range.end;
 
-    while start < end {
-        let Some(character) = source[start..end].chars().next() else {
-            break;
-        };
-        if !character.is_whitespace() {
-            break;
+    if trim_leading_whitespace {
+        while start < end {
+            let Some(character) = source[start..end].chars().next() else {
+                break;
+            };
+            if !character.is_whitespace() {
+                break;
+            }
+            start += character.len_utf8();
         }
-        start += character.len_utf8();
     }
 
     while start < end {
@@ -684,8 +715,10 @@ fn live_preview_block_kind(
             MarkdownEvent::Start(MarkdownTag::BlockQuote(_)) => {
                 return MarkdownLivePreviewBlockKind::BlockQuote;
             }
-            MarkdownEvent::Start(MarkdownTag::CodeBlock { .. }) => {
-                return MarkdownLivePreviewBlockKind::CodeBlock;
+            MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, .. }) => {
+                return MarkdownLivePreviewBlockKind::CodeBlock {
+                    is_indented: matches!(kind, CodeBlockKind::Indented),
+                };
             }
             MarkdownEvent::Start(MarkdownTag::Table(_)) => {
                 return MarkdownLivePreviewBlockKind::Table;
@@ -702,13 +735,21 @@ fn live_preview_block_text(
     events: &[(Range<usize>, MarkdownEvent)],
     kind: MarkdownLivePreviewBlockKind,
 ) -> String {
-    if let Some((_, MarkdownEvent::Start(MarkdownTag::CodeBlock { metadata, .. }))) = events
+    if let Some((_, MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, metadata }))) = events
         .iter()
         .find(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::CodeBlock { .. })))
     {
-        return source[metadata.content_range.clone()]
+        let text = source[metadata.content_range.clone()]
             .trim_end_matches('\n')
             .to_string();
+        return if matches!(kind, CodeBlockKind::Indented) {
+            text.lines()
+                .map(|line| line.strip_prefix("    ").unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text
+        };
     }
 
     let mut text = String::new();
@@ -1555,8 +1596,31 @@ mod tests {
         let blocks = markdown_live_preview_blocks("```rust\nlet value = 1;\n```\n");
 
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::CodeBlock);
+        assert_eq!(
+            blocks[0].kind,
+            MarkdownLivePreviewBlockKind::CodeBlock { is_indented: false }
+        );
         assert_eq!(blocks[0].display_text, "let value = 1;");
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_preserve_indented_code_source() {
+        let blocks =
+            markdown_live_preview_blocks("    plain indented code\n    no syntax highlighting\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].kind,
+            MarkdownLivePreviewBlockKind::CodeBlock { is_indented: true }
+        );
+        assert_eq!(
+            blocks[0].display_text,
+            "plain indented code\nno syntax highlighting"
+        );
+        assert_eq!(
+            blocks[0].source.as_ref(),
+            "    plain indented code\n    no syntax highlighting"
+        );
     }
 
     #[test]
