@@ -550,7 +550,7 @@ pub enum MarkdownLivePreviewBlockKind {
     List,
     Item,
     BlockQuote,
-    CodeBlock { is_indented: bool },
+    CodeBlock { is_indented: bool, is_mermaid: bool },
     Table,
     Rule,
     Other,
@@ -630,7 +630,23 @@ impl MarkdownLivePreviewBlockKind {
     }
 
     pub fn is_indented_code_block(self) -> bool {
-        matches!(self, Self::CodeBlock { is_indented: true })
+        matches!(
+            self,
+            Self::CodeBlock {
+                is_indented: true,
+                ..
+            }
+        )
+    }
+
+    pub fn is_mermaid_code_block(self) -> bool {
+        matches!(
+            self,
+            Self::CodeBlock {
+                is_mermaid: true,
+                ..
+            }
+        )
     }
 }
 
@@ -718,6 +734,7 @@ fn live_preview_block_kind(
             MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, .. }) => {
                 return MarkdownLivePreviewBlockKind::CodeBlock {
                     is_indented: matches!(kind, CodeBlockKind::Indented),
+                    is_mermaid: matches!(kind, CodeBlockKind::FencedLang(language) if language.as_ref() == "mermaid"),
                 };
             }
             MarkdownEvent::Start(MarkdownTag::Table(_)) => {
@@ -1598,7 +1615,10 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             blocks[0].kind,
-            MarkdownLivePreviewBlockKind::CodeBlock { is_indented: false }
+            MarkdownLivePreviewBlockKind::CodeBlock {
+                is_indented: false,
+                is_mermaid: false,
+            }
         );
         assert_eq!(blocks[0].display_text, "let value = 1;");
     }
@@ -1611,7 +1631,10 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             blocks[0].kind,
-            MarkdownLivePreviewBlockKind::CodeBlock { is_indented: true }
+            MarkdownLivePreviewBlockKind::CodeBlock {
+                is_indented: true,
+                is_mermaid: false,
+            }
         );
         assert_eq!(
             blocks[0].display_text,
@@ -1620,6 +1643,20 @@ mod tests {
         assert_eq!(
             blocks[0].source.as_ref(),
             "    plain indented code\n    no syntax highlighting"
+        );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_blocks_classify_mermaid_code_blocks() {
+        let blocks = markdown_live_preview_blocks("```mermaid\ngraph TD;\n```\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].kind,
+            MarkdownLivePreviewBlockKind::CodeBlock {
+                is_indented: false,
+                is_mermaid: true,
+            }
         );
     }
 

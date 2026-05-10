@@ -136,7 +136,7 @@ impl Editor {
                     MarkdownOptions {
                         parse_html: true,
                         parse_heading_slugs: false,
-                        render_mermaid_diagrams: false,
+                        render_mermaid_diagrams: true,
                         ..Default::default()
                     },
                     cx,
@@ -496,6 +496,7 @@ fn render_markdown_live_preview_block(
     image_cache: gpui::Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     let element_id = ElementId::from(block.source_range.start);
+    let is_mermaid_code_block = block.kind.is_mermaid_code_block();
     Arc::new(move |cx| {
         let editor_for_click = editor.clone();
         let source_range_for_click = block.source_range.clone();
@@ -530,10 +531,13 @@ fn render_markdown_live_preview_block(
             .w(cx.max_width)
             .max_w_full()
             .min_w_0()
-            .h((height as f32) * cx.line_height)
             .bg(cx.editor_style.background)
             .overflow_x_hidden()
-            .overflow_hidden()
+            .when(!is_mermaid_code_block, |element| {
+                element
+                    .h((height as f32) * cx.line_height)
+                    .overflow_hidden()
+            })
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_: &ClickEvent, window, cx| {
