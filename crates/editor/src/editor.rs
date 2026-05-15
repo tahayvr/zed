@@ -2690,7 +2690,7 @@ impl Editor {
                     }
                 }
                 EditorEvent::SelectionsChanged { .. } => {
-                    editor.reconcile_markdown_live_preview(window, cx);
+                    editor.reconcile_markdown_live_preview_selection(window, cx);
                 }
                 _ => (),
             },

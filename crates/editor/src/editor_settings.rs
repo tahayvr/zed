@@ -186,6 +186,7 @@ pub struct SearchSettings {
 
 #[derive(Clone, Debug)]
 pub struct Markdown {
+    /// Whether Markdown files render inline rich text previews when markup is inactive.
     pub live_preview: bool,
 }
 

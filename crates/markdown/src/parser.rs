@@ -610,14 +610,12 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
 
     for ix in 0..blocks.len().saturating_sub(1) {
         let next_start = blocks[ix + 1].source_range.start;
-        if text[blocks[ix].source_range.end..next_start]
-            .chars()
-            .all(char::is_whitespace)
-            && let Some((separator_end, _)) = text[blocks[ix].source_range.end..next_start]
-                .char_indices()
-                .next_back()
+        let separator = &text[blocks[ix].source_range.end..next_start];
+        if separator.chars().all(char::is_whitespace)
+            && let Some((last_separator_character_start, _)) = separator.char_indices().next_back()
         {
-            blocks[ix].replacement_range.end = blocks[ix].source_range.end + separator_end;
+            blocks[ix].replacement_range.end =
+                blocks[ix].source_range.end + last_separator_character_start;
         }
     }
 
@@ -734,7 +732,7 @@ fn live_preview_block_kind(
             MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, .. }) => {
                 return MarkdownLivePreviewBlockKind::CodeBlock {
                     is_indented: matches!(kind, CodeBlockKind::Indented),
-                    is_mermaid: matches!(kind, CodeBlockKind::FencedLang(language) if language.as_ref() == "mermaid"),
+                    is_mermaid: matches!(kind, CodeBlockKind::FencedLang(language) if is_mermaid_code_block_language(language)),
                 };
             }
             MarkdownEvent::Start(MarkdownTag::Table(_)) => {
@@ -745,6 +743,10 @@ fn live_preview_block_kind(
     }
 
     MarkdownLivePreviewBlockKind::Other
+}
+
+fn is_mermaid_code_block_language(language: &str) -> bool {
+    language.split_whitespace().next() == Some("mermaid")
 }
 
 fn live_preview_block_text(
@@ -1609,6 +1611,16 @@ mod tests {
     }
 
     #[test]
+    fn test_markdown_live_preview_blocks_leave_last_separator_character_editable() {
+        let blocks = markdown_live_preview_blocks("First paragraph.\n\n\nSecond paragraph.\n");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].source_range, 0..16);
+        assert_eq!(blocks[0].replacement_range, 0..18);
+        assert_eq!(blocks[1].source_range, 19..36);
+    }
+
+    #[test]
     fn test_markdown_live_preview_blocks_preserve_code_content() {
         let blocks = markdown_live_preview_blocks("```rust\nlet value = 1;\n```\n");
 
@@ -1648,7 +1660,7 @@ mod tests {
 
     #[test]
     fn test_markdown_live_preview_blocks_classify_mermaid_code_blocks() {
-        let blocks = markdown_live_preview_blocks("```mermaid\ngraph TD;\n```\n");
+        let blocks = markdown_live_preview_blocks("```mermaid 150\ngraph TD;\n```\n");
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(

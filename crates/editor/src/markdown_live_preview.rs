@@ -17,6 +17,7 @@ use markdown::{
 use settings::Settings;
 use text::Point;
 use ui::{Context, Window, div, prelude::*};
+use util::ResultExt;
 
 use crate::{
     BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, Editor, EditorSettings,
@@ -29,12 +30,13 @@ const IMAGE_FALLBACK_LINES: u32 = 24;
 #[derive(Default)]
 pub(crate) struct MarkdownLivePreviewState {
     blocks: Vec<MarkdownLivePreviewBlockState>,
+    parsed_blocks: Vec<MarkdownLivePreviewBlock>,
     image_cache: Option<gpui::Entity<RetainAllImageCache>>,
     image_dimensions_by_url: HashMap<String, (u32, u32)>,
     pending_image_dimension_urls: HashSet<String>,
     image_blocks_by_url: HashMap<String, CustomBlockId>,
     image_layout: MarkdownLivePreviewImageLayout,
-    _image_dimension_tasks: Vec<Task<()>>,
+    image_dimension_tasks: HashMap<String, Task<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,9 +74,36 @@ impl Editor {
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let text = snapshot.text();
+        let blocks = markdown_live_preview_blocks(&text);
+        self.reconcile_markdown_live_preview_blocks(blocks, window, cx);
+    }
+
+    pub(crate) fn reconcile_markdown_live_preview_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.should_render_markdown_live_preview(cx) {
+            self.remove_markdown_live_preview_blocks(cx);
+            return;
+        }
+
+        let Some(state) = self.markdown_live_preview.as_ref() else {
+            self.reconcile_markdown_live_preview(window, cx);
+            return;
+        };
+        self.reconcile_markdown_live_preview_blocks(state.parsed_blocks.clone(), window, cx);
+    }
+
+    fn reconcile_markdown_live_preview_blocks(
+        &mut self,
+        blocks: Vec<MarkdownLivePreviewBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
         let active_rows = self.active_markdown_live_preview_rows(cx);
         let editor = cx.entity().downgrade();
-        let blocks = markdown_live_preview_blocks(&text);
         let language_registry = self
             .project()
             .map(|project| project.read(cx).languages().clone());
@@ -98,16 +127,13 @@ impl Editor {
         state.image_blocks_by_url.clear();
         let image_dimensions_by_url = state.image_dimensions_by_url.clone();
         let image_layout = state.image_layout;
+        let parsed_blocks = blocks.clone();
         let mut old_blocks = std::mem::take(&mut state.blocks)
             .into_iter()
-            .map(|block| {
-                (
-                    live_preview_block_key(&block.replacement_range, &block.source),
-                    block,
-                )
-            })
+            .map(|block| (live_preview_block_key(&block.replacement_range), block))
             .collect::<HashMap<_, _>>();
         let mut retained_blocks = Vec::new();
+        let mut blocks_to_remove = HashSet::default();
 
         let mut block_properties = Vec::new();
         let mut new_block_metadata = Vec::new();
@@ -119,10 +145,13 @@ impl Editor {
             }
 
             let source = block.source.to_string();
-            let key = live_preview_block_key(&block.replacement_range, &source);
+            let key = live_preview_block_key(&block.replacement_range);
             if let Some(old_block) = old_blocks.remove(&key) {
-                retained_blocks.push(old_block);
-                continue;
+                if old_block.source == source {
+                    retained_blocks.push(old_block);
+                    continue;
+                }
+                blocks_to_remove.insert(old_block.block_id);
             }
 
             let start_anchor = snapshot.anchor_before(start);
@@ -170,10 +199,7 @@ impl Editor {
             new_block_metadata.push((replacement_range, source, image_destination, image_url));
         }
 
-        let blocks_to_remove = old_blocks
-            .into_values()
-            .map(|block| block.block_id)
-            .collect::<HashSet<_>>();
+        blocks_to_remove.extend(old_blocks.into_values().map(|block| block.block_id));
         if !blocks_to_remove.is_empty() {
             self.remove_blocks(blocks_to_remove, None, cx);
         }
@@ -241,60 +267,66 @@ impl Editor {
                 continue;
             };
 
-            state
-                ._image_dimension_tasks
-                .push(cx.spawn(async move |editor, cx| {
-                    let load = cx.update(|cx| {
-                        let load = AssetLogger::<ImageAssetLoader>::load(resource, cx);
-                        cx.background_spawn(load)
-                    });
-                    let image = load.await;
-                    editor
-                        .update(cx, |editor, cx| {
-                            let Some(state) = editor.markdown_live_preview.as_mut() else {
-                                return;
-                            };
-                            state.pending_image_dimension_urls.remove(&image_url);
+            let image_url_for_task = image_url.clone();
+            let task = cx.spawn(async move |editor, cx| {
+                let load = cx.update(|cx| {
+                    let load = AssetLogger::<ImageAssetLoader>::load(resource, cx);
+                    cx.background_spawn(load)
+                });
+                let image = load.await;
+                editor
+                    .update(cx, |editor, cx| {
+                        let Some(state) = editor.markdown_live_preview.as_mut() else {
+                            return;
+                        };
+                        state.pending_image_dimension_urls.remove(&image_url);
+                        state.image_dimension_tasks.remove(&image_url);
 
-                            let Ok(image) = image else {
-                                return;
-                            };
-                            let size = image.size(0);
-                            if size.width.0 <= 0 || size.height.0 <= 0 {
-                                return;
-                            }
+                        let Ok(image) = image else {
+                            return;
+                        };
+                        let size = image.size(0);
+                        if size.width.0 <= 0 || size.height.0 <= 0 {
+                            return;
+                        }
 
-                            let dimensions = (size.width.0 as u32, size.height.0 as u32);
-                            state
-                                .image_dimensions_by_url
-                                .insert(image_url.clone(), dimensions);
-                            let image_layout = state.image_layout;
-                            let Some(block_id) = state.image_blocks_by_url.get(&image_url).copied()
-                            else {
-                                return;
-                            };
+                        let dimensions = (size.width.0 as u32, size.height.0 as u32);
+                        state
+                            .image_dimensions_by_url
+                            .insert(image_url.clone(), dimensions);
+                        let image_layout = state.image_layout;
+                        let Some(block_id) = state.image_blocks_by_url.get(&image_url).copied()
+                        else {
+                            return;
+                        };
+                        if !state.blocks.iter().any(|block| block.block_id == block_id) {
+                            return;
+                        }
 
-                            editor.resize_blocks(
-                                [(
-                                    block_id,
-                                    image_height_for_dimensions(dimensions, image_layout),
-                                )]
-                                .into_iter()
-                                .collect(),
-                                None,
-                                cx,
-                            );
-                        })
-                        .ok();
-                }));
+                        editor.resize_blocks(
+                            [(
+                                block_id,
+                                image_height_for_dimensions(dimensions, image_layout),
+                            )]
+                            .into_iter()
+                            .collect(),
+                            None,
+                            cx,
+                        );
+                    })
+                    .log_err();
+            });
+            state.image_dimension_tasks.insert(image_url_for_task, task);
         }
 
         if retained_blocks.is_empty() {
+            state.parsed_blocks = parsed_blocks;
             self.markdown_live_preview = Some(state);
             return;
         }
 
         state.blocks = retained_blocks;
+        state.parsed_blocks = parsed_blocks;
         self.markdown_live_preview = Some(state);
     }
 
@@ -350,8 +382,8 @@ fn rows_intersect(rows: Range<u32>, active_rows: &[Range<u32>]) -> bool {
         .any(|active| rows.start < active.end && active.start < rows.end)
 }
 
-fn live_preview_block_key(source_range: &Range<usize>, source: &str) -> (usize, usize, String) {
-    (source_range.start, source_range.end, source.to_string())
+fn live_preview_block_key(source_range: &Range<usize>) -> (usize, usize) {
+    (source_range.start, source_range.end)
 }
 
 fn block_height(
