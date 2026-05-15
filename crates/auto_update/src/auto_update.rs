@@ -23,11 +23,14 @@ use std::{
     ffi::OsStr,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use util::command::new_command;
-use workspace::Workspace;
+use workspace::{MultiWorkspace, Toast, Workspace, notifications::NotificationId};
 
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
@@ -296,6 +299,46 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 
     if let Some(updater) = AutoUpdater::get(cx) {
         updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
+        let Some(multi_workspace_handle) = window.window_handle().downcast::<MultiWorkspace>()
+        else {
+            return;
+        };
+        let shown = Arc::new(AtomicBool::new(false));
+        let mut previous_status = AutoUpdateStatus::Idle;
+        cx.observe(&updater, {
+            move |updater, cx| {
+                if shown.load(Ordering::SeqCst) {
+                    return;
+                }
+                let (status, check_type) =
+                    updater.read_with(cx, |u, _| (u.status(), u.update_check_type()));
+
+                let just_completed = matches!(previous_status, AutoUpdateStatus::Checking)
+                    && matches!(status, AutoUpdateStatus::Idle);
+
+                previous_status = status;
+
+                if matches!(check_type, UpdateCheckType::Manual) && just_completed {
+                    shown.store(true, Ordering::SeqCst);
+                    multi_workspace_handle
+                        .update(cx, |multi_workspace, _, cx| {
+                            struct UpToDateToast;
+                            multi_workspace.workspace().update(cx, |workspace, cx| {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::unique::<UpToDateToast>(),
+                                        "Zed is up to date.",
+                                    )
+                                    .autohide(),
+                                    cx,
+                                );
+                            });
+                        })
+                        .ok();
+                }
+            }
+        })
+        .detach();
     } else {
         drop(window.prompt(
             gpui::PromptLevel::Info,
