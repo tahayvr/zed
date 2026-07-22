@@ -19,6 +19,7 @@ use smol::{
 };
 use std::mem;
 use std::{
+    cell::RefCell,
     env::{
         self,
         consts::{ARCH, OS},
@@ -26,10 +27,8 @@ use std::{
     ffi::OsStr,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    rc::Rc,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use util::command::new_command;
@@ -332,13 +331,11 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         else {
             return;
         };
-        let shown = Arc::new(AtomicBool::new(false));
         let mut previous_status = AutoUpdateStatus::Idle;
-        cx.observe(&updater, {
+        let subscription = Rc::new(RefCell::new(None));
+        *subscription.borrow_mut() = Some(cx.observe(&updater, {
+            let subscription = subscription.clone();
             move |updater, cx| {
-                if shown.load(Ordering::SeqCst) {
-                    return;
-                }
                 let (status, check_type) =
                     updater.read_with(cx, |u, _| (u.status(), u.update_check_type()));
 
@@ -348,7 +345,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
                 previous_status = status;
 
                 if matches!(check_type, UpdateCheckType::Manual) && just_completed {
-                    shown.store(true, Ordering::SeqCst);
+                    subscription.borrow_mut().take();
                     multi_workspace_handle
                         .update(cx, |multi_workspace, _, cx| {
                             struct UpToDateToast;
@@ -366,8 +363,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
                         .ok();
                 }
             }
-        })
-        .detach();
+        }));
     } else {
         drop(window.prompt(
             gpui::PromptLevel::Info,
