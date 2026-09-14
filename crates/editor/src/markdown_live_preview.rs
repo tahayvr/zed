@@ -12,7 +12,7 @@ use markdown::parser::{
 };
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
-    MarkdownOptions, MarkdownStyle,
+    MarkdownOptions, MarkdownStyle, WrapButtonVisibility,
 };
 use settings::Settings;
 use text::Point;
@@ -609,11 +609,12 @@ fn render_markdown_live_preview_block(
                         MarkdownElement::new(markdown.clone(), style)
                             .code_block_renderer(CodeBlockRenderer::Default {
                                 copy_button_visibility: CopyButtonVisibility::Hidden,
+                                wrap_button_visibility: WrapButtonVisibility::Hidden,
                                 border: true,
                             })
                             .image_resolver({
                                 let base_directory = base_directory.clone();
-                                move |dest_url| {
+                                move |dest_url, _cx| {
                                     resolve_markdown_live_preview_image(
                                         dest_url,
                                         base_directory.as_deref(),

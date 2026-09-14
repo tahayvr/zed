@@ -6,6 +6,63 @@ Examples can be run from the Zed repository root:
 cargo run -p gpui --example hello_world
 ```
 
+## Running in a browser
+
+A selection of these examples is also served by the standalone web gallery:
+
+```sh
+cd crates/gpui_web/examples/hello_web
+trunk serve
+```
+
+Open <http://localhost:8080/> to choose an example:
+
+| Path | Example |
+| --- | --- |
+| `/hello-world` | Hello world |
+| `/text` | Styled text |
+| `/text-layout` | Alignment and decorations |
+| `/text-wrapper` | Wrapping and truncation |
+| `/input` | Text input and selection |
+| `/prime-sieve` | Background task demo |
+
+The server supports direct links and reloads at each path. Only the selected
+example's WASM module is loaded. Follow **All examples** to return to the gallery;
+navigation reloads the page so the previous app and its workers are released.
+
+Install [Trunk](https://trunk-rs.github.io/trunk/) if needed. The gallery's toolchain file selects
+nightly Rust, the WASM target, and `rust-src`. Its Trunk configuration supplies the
+cross-origin-isolation headers needed for shared memory and watches the GPUI
+example and renderer sources for automatic rebuilds and browser reloads. Use a
+browser with WebGPU or WebGL2 support.
+
+The gallery builds separate Cargo binaries directly from the existing example
+sources. To add another browser-compatible example, register its binary in the
+gallery's `Cargo.toml`, add an auxiliary Rust asset in `index.html`, and add its
+gallery link with the corresponding `data-module` name.
+
+### Canvas font fallback
+
+The web text system uses browser fonts for eligible missing CJK and emoji
+graphemes. It renders each complete grapheme independently, retaining the primary
+font's baseline and line-spacing metrics. Contextual CJK spacing and arbitrary
+OpenType features are not reproduced. Other scripts remain on Cosmic Text.
+Browser font availability is assumed stable for the application's lifetime.
+
+With the gallery server running, a browser smoke test checks native-font
+preservation, whole-grapheme rendering, emoji atlas reuse, and input/deletion:
+
+```sh
+node crates/gpui_web/examples/hello_web/test_canvas_fallback.mjs
+```
+
+This requires Node.js 22 or newer and Chrome/Chromium. On macOS it uses the
+standard Google Chrome application path; elsewhere it uses `chromium`. Set
+`CHROME` to override the executable, and pass an optional server URL as the first
+argument. Screenshots and logs are saved under the gallery's ignored `target`
+directory. The test intercepts clipboard writes rather than modifying the system
+clipboard.
+
 ## Where to start
 
 - `hello_world` shows the basic shape of a GPUI application: create an
@@ -54,6 +111,7 @@ cargo run -p gpui --example hello_world
 - `move_entity_between_windows` shows moving an entity between windows.
 - `on_window_close_quit` demonstrates quitting when a window closes.
 - `set_menus` shows application menu setup.
+- `system_notifications` demonstrates posting, replacing, dismissing, and responding to operating-system notifications.
 - `window` demonstrates creating normal, dialog, popup, and floating windows.
 - `window_positioning` demonstrates window bounds and placement.
 - `window_shadow` demonstrates window shadow styling.
