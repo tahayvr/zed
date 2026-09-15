@@ -417,8 +417,8 @@
   // Markdown-specific editor settings.
   "markdown": {
     // Whether to enable live preview mode for Markdown files.
-    // Hides syntax markers when the cursor is not on them and renders
-    // rich text styling (bold, italic, heading colors) inline.
+    // Hides syntax markers on lines the cursor is not on, and renders
+    // images, tables, code blocks, and horizontal rules in place.
     //
     // Default: false
     "live_preview": false

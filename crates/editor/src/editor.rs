@@ -2640,7 +2640,6 @@ impl Editor {
                     editor.refresh_sticky_headers(&editor.snapshot(window, cx), cx);
                 }
                 EditorEvent::Edited { .. } => {
-                    editor.reconcile_markdown_live_preview(window, cx);
                     let vim_mode = vim_mode_setting::VimModeSetting::try_get(cx)
                         .map(|vim_mode| vim_mode.0)
                         .unwrap_or(false);
@@ -2734,6 +2733,7 @@ impl Editor {
                 editor.register_buffer(buffer.read(cx).remote_id(), cx);
             }
             editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
+            editor.schedule_markdown_live_preview_reparse(window, cx);
         }
 
         editor
@@ -10032,7 +10032,7 @@ impl Editor {
                 }
 
                 cx.emit(EditorEvent::BufferEdited);
-                self.reconcile_markdown_live_preview(window, cx);
+                self.schedule_markdown_live_preview_reparse(window, cx);
                 cx.emit(SearchEvent::MatchesInvalidated);
 
                 let Some(project) = &self.project else { return };
@@ -10124,6 +10124,7 @@ impl Editor {
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
+                self.schedule_markdown_live_preview_reparse(window, cx);
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
@@ -10142,7 +10143,6 @@ impl Editor {
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
-                self.reconcile_markdown_live_preview(window, cx);
                 cx.notify();
             }
             multi_buffer::Event::SettingsChanged => {
@@ -10267,7 +10267,7 @@ impl Editor {
             cx,
         );
         self.refresh_inline_values(cx);
-        self.reconcile_markdown_live_preview(window, cx);
+        self.schedule_markdown_live_preview_reparse(window, cx);
 
         let old_cursor_shape = self.cursor_shape;
         let old_breadcrumbs_visible = self.breadcrumbs_visible();

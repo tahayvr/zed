@@ -1045,9 +1045,10 @@ pub struct JupyterContent {
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct MarkdownContent {
-    /// Whether to enable live preview mode for Markdown files, which hides
-    /// syntax markers when the cursor is not on them and renders rich text
-    /// styling (bold, italic, heading colors) inline in the editor.
+    /// Whether to enable live preview mode for Markdown files. Syntax markers
+    /// such as heading hashes, emphasis delimiters, and list bullets are hidden
+    /// on lines the cursor is not on, and images, tables, code blocks, and
+    /// horizontal rules are rendered in place.
     ///
     /// Default: false
     pub live_preview: Option<bool>,

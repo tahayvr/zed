@@ -717,8 +717,87 @@ pub enum MarkdownLivePreviewBlockKind {
     Other,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownLivePreviewLayout {
+    /// Blocks that are rendered as replacement blocks in the editor.
+    pub blocks: Vec<MarkdownLivePreviewBlock>,
+    /// Inline syntax markers that are hidden or substituted in place.
+    pub inline_markers: Vec<MarkdownLivePreviewInlineMarker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownLivePreviewInlineMarker {
+    pub range: Range<usize>,
+    pub kind: MarkdownLivePreviewInlineMarkerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkdownLivePreviewInlineMarkerKind {
+    /// Syntax that is hidden entirely, such as emphasis delimiters or heading hashes.
+    Hidden,
+    /// An unordered list marker, rendered as a bullet.
+    Bullet,
+    /// A task list marker, rendered as a checkbox.
+    TaskListMarker { checked: bool },
+    /// A block quote marker, rendered as a vertical bar.
+    BlockQuote,
+}
+
+pub fn markdown_live_preview_layout(text: &str) -> MarkdownLivePreviewLayout {
+    let parsed = parse_markdown_with_options(text, false, false, false);
+    let root_blocks = live_preview_root_blocks(text, &parsed);
+
+    let mut inline_markers = Vec::new();
+    for (block, event_range) in &root_blocks {
+        if block.kind.is_rich() {
+            continue;
+        }
+        live_preview_inline_markers(
+            text,
+            &parsed.events[event_range.clone()],
+            &mut inline_markers,
+        );
+    }
+    inline_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+
+    let mut deduplicated_markers: Vec<MarkdownLivePreviewInlineMarker> =
+        Vec::with_capacity(inline_markers.len());
+    for marker in inline_markers {
+        if marker.range.start >= marker.range.end {
+            continue;
+        }
+        if let Some(previous) = deduplicated_markers.last()
+            && marker.range.start < previous.range.end
+        {
+            continue;
+        }
+        deduplicated_markers.push(marker);
+    }
+
+    MarkdownLivePreviewLayout {
+        blocks: root_blocks
+            .into_iter()
+            .map(|(block, _)| block)
+            .filter(|block| block.kind.is_rich())
+            .collect(),
+        inline_markers: deduplicated_markers,
+    }
+}
+
 pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock> {
     let parsed = parse_markdown_with_options(text, false, false, false);
+    live_preview_root_blocks(text, &parsed)
+        .into_iter()
+        .map(|(block, _)| block)
+        .collect()
+}
+
+/// Splits the document into root-level blocks. Each block is paired with the range of
+/// parser events (indices into `parsed.events`) that produced it.
+fn live_preview_root_blocks(
+    text: &str,
+    parsed: &ParsedMarkdownData,
+) -> Vec<(MarkdownLivePreviewBlock, Range<usize>)> {
     let mut blocks = Vec::new();
     let mut block_start_event_index = None;
 
@@ -756,34 +835,209 @@ pub fn markdown_live_preview_blocks(text: &str) -> Vec<MarkdownLivePreviewBlock>
                 }
 
                 let display_text = live_preview_block_text(text, events, kind);
-                blocks.push(MarkdownLivePreviewBlock {
-                    source_range: source_range.clone(),
-                    replacement_range: source_range.clone(),
-                    source: SharedString::from(&text[source_range]),
-                    display_text: SharedString::from(display_text),
-                    image_destination: live_preview_block_image_destination(events),
-                    kind,
-                });
+                blocks.push((
+                    MarkdownLivePreviewBlock {
+                        source_range: source_range.clone(),
+                        replacement_range: source_range.clone(),
+                        source: SharedString::from(&text[source_range]),
+                        display_text: SharedString::from(display_text),
+                        image_destination: live_preview_block_image_destination(events),
+                        kind,
+                    },
+                    start_event_index..event_ix,
+                ));
             }
             _ => {}
         }
     }
 
     for ix in 0..blocks.len().saturating_sub(1) {
-        let next_start = blocks[ix + 1].source_range.start;
-        let separator = &text[blocks[ix].source_range.end..next_start];
+        let next_start = blocks[ix + 1].0.source_range.start;
+        let separator = &text[blocks[ix].0.source_range.end..next_start];
         if separator.chars().all(char::is_whitespace)
             && let Some((last_separator_character_start, _)) = separator.char_indices().next_back()
         {
-            blocks[ix].replacement_range.end =
-                blocks[ix].source_range.end + last_separator_character_start;
+            blocks[ix].0.replacement_range.end =
+                blocks[ix].0.source_range.end + last_separator_character_start;
         }
     }
 
     blocks
 }
 
+fn live_preview_inline_markers(
+    text: &str,
+    events: &[(Range<usize>, MarkdownEvent)],
+    markers: &mut Vec<MarkdownLivePreviewInlineMarker>,
+) {
+    use MarkdownLivePreviewInlineMarkerKind as Kind;
+
+    let mut push = |range: Range<usize>, kind: Kind| {
+        if range.start < range.end {
+            markers.push(MarkdownLivePreviewInlineMarker { range, kind });
+        }
+    };
+
+    let mut open_tags: Vec<(usize, &MarkdownTag, &Range<usize>)> = Vec::new();
+    for (event_ix, (range, event)) in events.iter().enumerate() {
+        match event {
+            MarkdownEvent::Start(tag) => open_tags.push((event_ix, tag, range)),
+            MarkdownEvent::End(_) => {
+                let Some((start_ix, tag, tag_range)) = open_tags.pop() else {
+                    continue;
+                };
+                let inner = &events[start_ix + 1..event_ix];
+                let content_range = inner
+                    .iter()
+                    .map(|(range, _)| range.start)
+                    .min()
+                    .zip(inner.iter().map(|(range, _)| range.end).max());
+
+                match tag {
+                    MarkdownTag::Emphasis
+                    | MarkdownTag::Strong
+                    | MarkdownTag::Strikethrough
+                    | MarkdownTag::Link { .. } => {
+                        let Some((content_start, content_end)) = content_range else {
+                            continue;
+                        };
+                        push(tag_range.start..content_start, Kind::Hidden);
+                        push(
+                            trim_end_whitespace(text, content_end..tag_range.end),
+                            Kind::Hidden,
+                        );
+                    }
+                    MarkdownTag::Heading { .. } => {
+                        let Some((content_start, content_end)) = content_range else {
+                            continue;
+                        };
+                        push(tag_range.start..content_start, Kind::Hidden);
+                        // Closing hashes of an ATX heading, or the underline of a setext heading.
+                        push(
+                            trim_end_whitespace(text, content_end..tag_range.end),
+                            Kind::Hidden,
+                        );
+                    }
+                    MarkdownTag::Item => {
+                        let marker_start = tag_range.start;
+                        let task_marker = inner.iter().find_map(|(range, event)| match event {
+                            MarkdownEvent::TaskListMarker(checked) => Some((range, *checked)),
+                            _ => None,
+                        });
+                        if let Some((task_range, checked)) = task_marker
+                            && task_range.start >= marker_start
+                            && text[marker_start..task_range.start]
+                                .chars()
+                                .all(|character| {
+                                    character.is_ascii_digit()
+                                        || character.is_whitespace()
+                                        || matches!(character, '-' | '*' | '+' | '.' | ')')
+                                })
+                        {
+                            push(
+                                marker_start..task_range.end,
+                                Kind::TaskListMarker { checked },
+                            );
+                        } else if matches!(
+                            text[marker_start..].chars().next(),
+                            Some('-' | '*' | '+')
+                        ) {
+                            push(marker_start..marker_start + 1, Kind::Bullet);
+                        }
+                    }
+                    MarkdownTag::BlockQuote(_) => {
+                        let mut line_start = tag_range.start;
+                        for line in text[tag_range.clone()].split_inclusive('\n') {
+                            let bytes = line.as_bytes();
+                            let mut ix = 0;
+                            while ix < bytes.len() && ix < 3 && bytes[ix] == b' ' {
+                                ix += 1;
+                            }
+                            while ix < bytes.len() && bytes[ix] == b'>' {
+                                push(line_start + ix..line_start + ix + 1, Kind::BlockQuote);
+                                ix += 1;
+                                if ix < bytes.len() && bytes[ix] == b' ' {
+                                    ix += 1;
+                                }
+                            }
+                            line_start += line.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            MarkdownEvent::Code | MarkdownEvent::SubstitutedCode(_) => {
+                if let Some((leading, trailing)) = code_span_delimiters(text, range.clone()) {
+                    push(leading, Kind::Hidden);
+                    push(trailing, Kind::Hidden);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn trim_end_whitespace(text: &str, range: Range<usize>) -> Range<usize> {
+    let trimmed_len = text[range.clone()].trim_end().len();
+    range.start..range.start + trimmed_len
+}
+
+/// Finds the backtick delimiters surrounding an inline code span whose content
+/// occupies `content_range`. Returns the leading and trailing delimiter ranges.
+fn code_span_delimiters(
+    text: &str,
+    content_range: Range<usize>,
+) -> Option<(Range<usize>, Range<usize>)> {
+    let bytes = text.as_bytes();
+
+    let mut leading_end = content_range.start;
+    if leading_end > 0 && bytes[leading_end - 1] == b' ' {
+        leading_end -= 1;
+    }
+    let mut leading_start = leading_end;
+    while leading_start > 0 && bytes[leading_start - 1] == b'`' {
+        leading_start -= 1;
+    }
+
+    let mut trailing_start = content_range.end;
+    if trailing_start < bytes.len() && bytes[trailing_start] == b' ' {
+        trailing_start += 1;
+    }
+    let mut trailing_end = trailing_start;
+    while trailing_end < bytes.len() && bytes[trailing_end] == b'`' {
+        trailing_end += 1;
+    }
+
+    let leading_ticks = leading_end - leading_start;
+    let trailing_ticks = trailing_end - trailing_start;
+    if leading_ticks == 0 || leading_ticks != trailing_ticks {
+        return None;
+    }
+
+    // Only swallow the padding space when the delimiter actually follows it.
+    let leading = if leading_end == content_range.start {
+        leading_start..leading_end
+    } else {
+        leading_start..content_range.start
+    };
+    let trailing = if trailing_start == content_range.end {
+        trailing_start..trailing_end
+    } else {
+        content_range.end..trailing_end
+    };
+    Some((leading, trailing))
+}
+
 impl MarkdownLivePreviewBlockKind {
+    /// Whether the block is rendered as a replacement block instead of being
+    /// shown inline with its syntax markers hidden.
+    pub fn is_rich(self) -> bool {
+        matches!(
+            self,
+            Self::Image | Self::CodeBlock { .. } | Self::Table | Self::Rule
+        )
+    }
+
     pub fn is_code_block(self) -> bool {
         matches!(self, Self::CodeBlock { .. })
     }
@@ -2161,6 +2415,117 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, MarkdownLivePreviewBlockKind::Image);
         assert_eq!(blocks[0].image_destination.as_deref(), Some("my image.png"));
+    }
+
+    #[test]
+    fn test_markdown_live_preview_layout_hides_inline_markers() {
+        use MarkdownLivePreviewInlineMarkerKind::Hidden;
+
+        let layout = markdown_live_preview_layout(
+            "# Title\n\nSome **bold** and *em* and `code` and [link](http://x).\n",
+        );
+
+        assert!(layout.blocks.is_empty());
+        let markers = layout
+            .inline_markers
+            .iter()
+            .map(|marker| (marker.range.clone(), marker.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![
+                (0..2, Hidden),
+                (14..16, Hidden),
+                (20..22, Hidden),
+                (27..28, Hidden),
+                (30..31, Hidden),
+                (36..37, Hidden),
+                (41..42, Hidden),
+                (47..48, Hidden),
+                (52..63, Hidden),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_layout_hides_setext_underline() {
+        let layout = markdown_live_preview_layout("Title\n=====\n\nBody\n");
+        let markers = layout
+            .inline_markers
+            .iter()
+            .map(|marker| (marker.range.clone(), marker.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![(5..11, MarkdownLivePreviewInlineMarkerKind::Hidden)]
+        );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_layout_substitutes_list_markers() {
+        use MarkdownLivePreviewInlineMarkerKind::{Bullet, TaskListMarker};
+
+        let layout = markdown_live_preview_layout("- item\n- [ ] task\n- [x] done\n1. ordered\n");
+        let markers = layout
+            .inline_markers
+            .iter()
+            .map(|marker| (marker.range.clone(), marker.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![
+                (0..1, Bullet),
+                (7..12, TaskListMarker { checked: false }),
+                (18..23, TaskListMarker { checked: true }),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_layout_substitutes_block_quote_markers() {
+        use MarkdownLivePreviewInlineMarkerKind::BlockQuote;
+
+        let layout = markdown_live_preview_layout("> quote\n> > nested\n");
+        let markers = layout
+            .inline_markers
+            .iter()
+            .map(|marker| (marker.range.clone(), marker.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![(0..1, BlockQuote), (8..9, BlockQuote), (10..11, BlockQuote)]
+        );
+    }
+
+    #[test]
+    fn test_markdown_live_preview_layout_only_replaces_rich_blocks() {
+        let layout = markdown_live_preview_layout(
+            "Para with **bold**\n\n```\n**not bold**\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![img](x.png)\n\n---\n",
+        );
+
+        let kinds = layout
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                MarkdownLivePreviewBlockKind::CodeBlock {
+                    is_indented: false,
+                    is_mermaid: false,
+                },
+                MarkdownLivePreviewBlockKind::Table,
+                MarkdownLivePreviewBlockKind::Image,
+                MarkdownLivePreviewBlockKind::Rule,
+            ]
+        );
+        let markers = layout
+            .inline_markers
+            .iter()
+            .map(|marker| marker.range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(markers, vec![10..12, 16..18]);
     }
 
     #[test]
