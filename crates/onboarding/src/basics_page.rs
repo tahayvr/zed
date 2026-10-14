@@ -501,7 +501,7 @@ fn render_setting_import_button(
 
 fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let import_state = SettingsImportState::global(cx);
-    let imports: [(SharedString, &dyn Action, bool); 2] = [
+    let imports: [(SharedString, &dyn Action, bool); 3] = [
         (
             "VS Code".into(),
             &ImportVsCodeSettings { skip_prompt: false },
@@ -512,9 +512,10 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
             &ImportCursorSettings { skip_prompt: false },
             import_state.cursor,
         ),
+        ("Sync Repository".into(), &settings_sync::SetUp, false),
     ];
 
-    let [vscode, cursor] = imports.map(|(label, action, imported)| {
+    let [vscode, cursor, sync_repository] = imports.map(|(label, action, imported)| {
         *tab_index += 1;
         render_setting_import_button(*tab_index - 1, label, action, imported)
     });
@@ -529,11 +530,19 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
                 .max_w_5_6()
                 .child(Label::new("Import Settings"))
                 .child(
-                    Label::new("Automatically pull your settings from other editors")
-                        .color(Color::Muted),
+                    Label::new(
+                        "Pull your settings from other editors, or from a Zed sync repository",
+                    )
+                    .color(Color::Muted),
                 ),
         )
-        .child(h_flex().gap_1().child(vscode).child(cursor))
+        .child(
+            h_flex()
+                .gap_1()
+                .child(vscode)
+                .child(cursor)
+                .child(sync_repository),
+        )
 }
 
 pub(crate) const FEATURED_AGENT_IDS: &[&str] =

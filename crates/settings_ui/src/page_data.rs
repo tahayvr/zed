@@ -428,6 +428,33 @@ fn general_page(cx: &App) -> SettingsPage {
         ]
     }
 
+    fn settings_sync_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Settings Sync"),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Settings Sync".into(),
+                r#type: Default::default(),
+                description: Some(
+                    "Sync your configuration across machines through a private git repository."
+                        .into(),
+                ),
+                search_aliases: &[
+                    "sync",
+                    "backup",
+                    "git",
+                    "machines",
+                    "dotfiles",
+                    "repository",
+                    "restore",
+                ],
+                json_path: Some(settings_sync::SETTINGS_SYNC_PATH),
+                in_json: false,
+                files: USER,
+                render: crate::pages::render_settings_sync_page,
+            }),
+        ]
+    }
+
     fn privacy_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Privacy"),
@@ -545,6 +572,7 @@ fn general_page(cx: &App) -> SettingsPage {
             security_section(),
             workspace_restoration_section(),
             scoped_settings_section(),
+            settings_sync_section(),
             privacy_section(),
             auto_update_section(),
             extensions_section(),

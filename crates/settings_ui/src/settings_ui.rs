@@ -923,6 +923,19 @@ fn open_settings_editor_with(
                     callback(settings_window, window, cx);
                 });
 
+                // Every toggle in this window writes settings.json; let
+                // automatic syncs wait longer while it is open so a series of
+                // toggles lands as one run.
+                if let Some(sync) = settings_sync::SettingsSyncService::try_global(cx) {
+                    sync.update(cx, |sync, cx| sync.set_settings_window_open(true, cx));
+                    cx.observe_release(&settings_window, |_, cx| {
+                        if let Some(sync) = settings_sync::SettingsSyncService::try_global(cx) {
+                            sync.update(cx, |sync, cx| sync.set_settings_window_open(false, cx));
+                        }
+                    })
+                    .detach();
+                }
+
                 settings_window
             },
         )
@@ -1013,6 +1026,9 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    /// The Settings Sync page keeps its own editors and async state, so it is
+    /// an entity rather than a stateless render function.
+    settings_sync_page: Option<Entity<pages::SettingsSyncPage>>,
 }
 
 struct SearchDocument {
@@ -2035,6 +2051,8 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            settings_sync_page: settings_sync::SettingsSyncService::try_global(cx)
+                .map(|service| cx.new(|cx| pages::SettingsSyncPage::new(service, window, cx))),
         };
 
         this.fetch_files(window, cx);
@@ -3825,6 +3843,8 @@ impl SettingsWindow {
                 && current_sub_page.link.title.as_ref() == "LLM Providers";
             let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
             let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
+            let is_settings_sync_page =
+                current_sub_page.link.json_path == Some(settings_sync::SETTINGS_SYNC_PATH);
 
             page_header = h_flex()
                 .w_full()
@@ -3865,6 +3885,9 @@ impl SettingsWindow {
                         })
                         .when(is_llm_providers_page, |this| {
                             this.child(pages::render_add_llm_provider_popover(self, window, cx))
+                        })
+                        .when(is_settings_sync_page, |this| {
+                            this.children(pages::render_settings_sync_header_action(self, cx))
                         })
                         .when(is_skills_page, |this| {
                             this.child(
@@ -4382,6 +4405,10 @@ impl SettingsWindow {
             render,
         };
         self.push_sub_page(sub_page_link, section_header.into(), window, cx);
+    }
+
+    pub(crate) fn settings_sync_page(&self) -> Option<Entity<pages::SettingsSyncPage>> {
+        self.settings_sync_page.clone()
     }
 
     pub(crate) fn skill_creator_page(&self) -> Option<Entity<pages::SkillCreatorPage>> {
@@ -5491,6 +5518,7 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                settings_sync_page: None,
             }
         }
     }
@@ -5631,6 +5659,7 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            settings_sync_page: None,
         };
 
         settings_window.build_filter_table();

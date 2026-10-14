@@ -629,12 +629,16 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let line_ending_indicator =
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
+        let settings_sync_button = cx.new(|cx| settings_sync::SettingsSyncButton::new(cx));
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
+            // Sits before the items that render empty most of the time, since
+            // each empty item still contributes a flex gap before whatever follows.
+            status_bar.add_left_item(settings_sync_button, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
@@ -5966,6 +5970,7 @@ mod tests {
                 "search",
                 "settings_editor",
                 "settings_profile_selector",
+                "settings_sync",
                 "skill_creator",
                 "snippets",
                 "stash_picker",
