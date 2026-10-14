@@ -13,8 +13,8 @@ use settings_sync::{
     Side, SyncConfig, SyncEvent, SyncState, describe_time_ago, diff_lines,
 };
 use ui::{
-    Banner, ButtonLink, Divider, IconButton, Indicator, ListItem, Switch, ToggleState, Tooltip,
-    prelude::*,
+    Banner, ButtonLink, Divider, IconButton, Indicator, ListItem, Switch, ToggleButtonGroup,
+    ToggleButtonGroupStyle, ToggleButtonSimple, ToggleState, Tooltip, prelude::*,
 };
 
 use crate::{
@@ -103,7 +103,6 @@ pub struct SettingsSyncPage {
     restore: Option<RestoreState>,
     key_choices: HashMap<(String, String), Side>,
     file_choices: HashMap<String, Side>,
-    expanded_conflict_diffs: HashSet<String>,
     resolving: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -153,7 +152,6 @@ impl SettingsSyncPage {
             restore: None,
             key_choices: HashMap::default(),
             file_choices: HashMap::default(),
-            expanded_conflict_diffs: HashSet::default(),
             resolving: false,
             _subscriptions: subscriptions,
         };
@@ -343,7 +341,6 @@ impl SettingsSyncPage {
                 this.resolving = false;
                 this.key_choices.clear();
                 this.file_choices.clear();
-                this.expanded_conflict_diffs.clear();
                 if let Err(error) = result {
                     this.action_error = Some(format!("{error:#}").into());
                 }
@@ -802,57 +799,50 @@ impl SettingsSyncPage {
             return None;
         }
         let resolving = self.resolving;
+        let count = conflicts.len();
 
-        let items = conflicts
+        let rows = conflicts
             .iter()
             .enumerate()
-            .map(|(index, pending)| self.render_conflict(index, pending, cx));
+            .map(|(index, pending)| self.render_conflict(index, pending, index + 1 == count, cx));
 
         Some(
             section(
                 "Conflicts",
                 v_flex()
-                    .gap_3()
                     .child(
-                        Label::new("Changed both locally and remotely since the last sync.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(
+                            "Changed both locally and remotely since the last sync. Choose a side for each, then apply.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
-                    .children(items)
+                    .children(rows)
                     .child(
                         h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new(
-                                    "apply-resolutions",
-                                    if resolving {
-                                        "Applying…"
-                                    } else {
-                                        "Apply choices"
-                                    },
-                                )
-                                .style(ButtonStyle::Filled)
-                                .tab_index(0_isize)
-                                .disabled(resolving)
-                                .on_click(cx.listener(|this, _, _, cx| this.apply_resolutions(cx))),
-                            )
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
                             .child(
                                 Button::new("resolve-all-local", "Keep All Local")
-                                    .style(ButtonStyle::Outlined)
+                                    .style(ButtonStyle::Subtle)
                                     .tab_index(0_isize)
                                     .disabled(resolving)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.resolve_all(Side::Local, cx)
-                                    })),
+                                    .on_click(cx.listener(|this, _, _, cx| this.resolve_all(Side::Local, cx))),
                             )
                             .child(
                                 Button::new("resolve-all-remote", "Use All Remote")
-                                    .style(ButtonStyle::Outlined)
+                                    .style(ButtonStyle::Subtle)
                                     .tab_index(0_isize)
                                     .disabled(resolving)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.resolve_all(Side::Remote, cx)
-                                    })),
+                                    .on_click(cx.listener(|this, _, _, cx| this.resolve_all(Side::Remote, cx))),
+                            )
+                            .child(
+                                Button::new("apply-resolutions", if resolving { "Applying…" } else { "Apply" })
+                                    .style(ButtonStyle::Filled)
+                                    .tab_index(0_isize)
+                                    .disabled(resolving)
+                                    .on_click(cx.listener(|this, _, _, cx| this.apply_resolutions(cx))),
                             ),
                     )
                     .into_any_element(),
@@ -865,18 +855,32 @@ impl SettingsSyncPage {
         &self,
         index: usize,
         pending: &PendingConflict,
+        is_last: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let repo_path = pending.file.repo_path.clone();
         let label = pending.file.label.clone();
-        let description = match pending.conflict.kind {
-            ConflictKind::BothChanged => "Changed on both sides",
-            ConflictKind::LocalDeleted => "Deleted locally, changed remotely",
-            ConflictKind::RemoteDeleted => "Deleted remotely, changed locally",
-        };
+        let can_diff = pending.conflict.local.is_some() && pending.conflict.remote.is_some();
 
-        let body = if pending.conflict.is_key_level() {
-            let rows =
+        let open_diff = can_diff.then(|| {
+            let pending = pending.clone();
+            IconButton::new(("conflict-open-diff", index), IconName::Diff)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tab_index(0_isize)
+                .tooltip(Tooltip::text("Open Diff in Editor"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_conflict_in_editor(&pending, cx);
+                }))
+        });
+
+        if pending.conflict.is_key_level() {
+            let key_count = pending.conflict.key_conflicts.len();
+            let description = format!(
+                "{key_count} key{} changed on both sides; other changes merged.",
+                if key_count == 1 { "" } else { "s" }
+            );
+            let sub_rows =
                 pending
                     .conflict
                     .key_conflicts
@@ -889,168 +893,93 @@ impl SettingsSyncPage {
                             .get(&(repo_path.clone(), key.clone()))
                             .copied()
                             .unwrap_or(Side::Local);
-                        let local_preview = preview_value(conflict.local.as_ref());
-                        let remote_preview = preview_value(conflict.remote.as_ref());
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .py_1()
-                            .child(
-                                div()
-                                    .w_48()
-                                    .child(Label::new(key.clone()).size(LabelSize::Small)),
-                            )
-                            .child(self.render_side_choice(
-                                ("conflict-key-local", index * 1000 + key_index),
-                                format!("Local: {local_preview}"),
-                                choice == Side::Local,
-                                {
-                                    let repo_path = repo_path.clone();
-                                    let key = key.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.key_choices
-                                            .insert((repo_path.clone(), key.clone()), Side::Local);
-                                        cx.notify();
-                                    })
-                                },
-                            ))
-                            .child(self.render_side_choice(
-                                ("conflict-key-remote", index * 1000 + key_index),
-                                format!("Remote: {remote_preview}"),
-                                choice == Side::Remote,
-                                {
-                                    let repo_path = repo_path.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.key_choices
-                                            .insert((repo_path.clone(), key.clone()), Side::Remote);
-                                        cx.notify();
-                                    })
-                                },
-                            ))
+                        let values = format!(
+                            "Local: {} · Remote: {}",
+                            preview_value(conflict.local.as_ref()),
+                            preview_value(conflict.remote.as_ref())
+                        );
+                        let choose = |side: Side| {
+                            let repo_path = repo_path.clone();
+                            let key = key.clone();
+                            cx.listener(move |this: &mut Self, _, _, cx| {
+                                this.key_choices
+                                    .insert((repo_path.clone(), key.clone()), side);
+                                cx.notify();
+                            })
+                        };
+                        setting_sub_row(
+                            key.clone(),
+                            values,
+                            side_toggle(
+                                format!("conflict-key-{}", index * 1000 + key_index),
+                                "Local",
+                                "Remote",
+                                choice,
+                                choose(Side::Local),
+                                choose(Side::Remote),
+                            ),
+                            key_index + 1 == key_count,
+                            cx,
+                        )
+                        .into_any_element()
                     });
-            v_flex().children(rows).into_any_element()
-        } else {
-            let choice = self.file_choices.get(&repo_path).copied();
-            let (local_label, remote_label) = match pending.conflict.kind {
-                ConflictKind::BothChanged => ("Keep Local", "Use Remote"),
-                ConflictKind::LocalDeleted => ("Delete Remote", "Restore From Remote"),
-                ConflictKind::RemoteDeleted => ("Keep Local", "Delete Local"),
-            };
-            let diff_expanded = self.expanded_conflict_diffs.contains(&repo_path);
-            let can_diff = pending.conflict.local.is_some() && pending.conflict.remote.is_some();
+            return v_flex()
+                .w_full()
+                .child(setting_row(
+                    label,
+                    description,
+                    h_flex().children(open_diff).into_any_element(),
+                    false,
+                ))
+                .children(sub_rows)
+                .into_any_element();
+        }
 
-            v_flex()
-                .gap_2()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .child(self.render_side_choice(
-                            ("conflict-file-local", index),
-                            local_label.to_string(),
-                            choice == Some(Side::Local),
-                            {
-                                let repo_path = repo_path.clone();
-                                cx.listener(move |this, _, _, cx| {
-                                    this.file_choices.insert(repo_path.clone(), Side::Local);
-                                    cx.notify();
-                                })
-                            },
-                        ))
-                        .child(self.render_side_choice(
-                            ("conflict-file-remote", index),
-                            remote_label.to_string(),
-                            choice == Some(Side::Remote),
-                            {
-                                let repo_path = repo_path.clone();
-                                cx.listener(move |this, _, _, cx| {
-                                    this.file_choices.insert(repo_path.clone(), Side::Remote);
-                                    cx.notify();
-                                })
-                            },
-                        ))
-                        .when(can_diff, |this| {
-                            this.child(
-                                Button::new(
-                                    ("conflict-toggle-diff", index),
-                                    if diff_expanded {
-                                        "Hide changes"
-                                    } else {
-                                        "Show changes"
-                                    },
-                                )
-                                .style(ButtonStyle::Subtle)
-                                .tab_index(0_isize)
-                                .on_click({
-                                    let repo_path = repo_path.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        if !this.expanded_conflict_diffs.remove(&repo_path) {
-                                            this.expanded_conflict_diffs.insert(repo_path.clone());
-                                        }
-                                        cx.notify();
-                                    })
-                                }),
-                            )
-                            .child(
-                                Button::new(("conflict-open-editor", index), "Open diff in editor")
-                                    .style(ButtonStyle::Subtle)
-                                    .tab_index(0_isize)
-                                    .on_click({
-                                        let pending = pending.clone();
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.open_conflict_in_editor(&pending, cx);
-                                        })
-                                    }),
-                            )
-                        }),
-                )
-                .when(diff_expanded && can_diff, |this| {
-                    this.child(render_diff(
-                        pending.conflict.local.as_deref().unwrap_or_default(),
-                        pending.conflict.remote.as_deref().unwrap_or_default(),
-                        "local",
-                        "remote",
-                        cx,
-                    ))
-                })
-                .into_any_element()
+        let (description, local_label, remote_label) = match pending.conflict.kind {
+            ConflictKind::BothChanged => ("Changed on both sides.", "Keep Local", "Use Remote"),
+            ConflictKind::LocalDeleted => (
+                "Deleted locally, changed remotely.",
+                "Delete Remote",
+                "Restore From Remote",
+            ),
+            ConflictKind::RemoteDeleted => (
+                "Deleted remotely, changed locally.",
+                "Keep Local",
+                "Delete Local",
+            ),
+        };
+        let choice = self
+            .file_choices
+            .get(&repo_path)
+            .copied()
+            .unwrap_or(Side::Local);
+        let choose = |side: Side| {
+            let repo_path = repo_path.clone();
+            cx.listener(move |this: &mut Self, _, _, cx| {
+                this.file_choices.insert(repo_path.clone(), side);
+                cx.notify();
+            })
         };
 
-        v_flex()
-            .gap_1()
-            .p_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Label::new(label))
-                    .child(
-                        Label::new(description)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(body)
-            .into_any_element()
-    }
-
-    fn render_side_choice(
-        &self,
-        id: impl Into<ElementId>,
-        label: String,
-        selected: bool,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        Button::new(id, label)
-            .style(ButtonStyle::Outlined)
-            .tab_index(0_isize)
-            .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
-            .toggle_state(selected)
-            .on_click(on_click)
-            .into_any_element()
+        setting_row(
+            label,
+            description,
+            h_flex()
+                .gap_2()
+                .items_center()
+                .children(open_diff)
+                .child(side_toggle(
+                    format!("conflict-file-{index}"),
+                    local_label,
+                    remote_label,
+                    choice,
+                    choose(Side::Local),
+                    choose(Side::Remote),
+                ))
+                .into_any_element(),
+            !is_last,
+        )
+        .into_any_element()
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1077,6 +1006,7 @@ impl SettingsSyncPage {
                 this.update_config(move |config| config.sync_extensions = !sync_extensions, cx);
             }))
             .into_any_element(),
+            true,
             cx,
         )
         .into_any_element();
@@ -1191,14 +1121,27 @@ impl SettingsSyncPage {
                     control,
                     !is_settings && index + 1 < group_count,
                 );
-                match (is_settings, extensions_row.take()) {
-                    (true, Some(extensions_row)) => v_flex()
-                        .w_full()
-                        .child(row)
-                        .child(extensions_row)
-                        .into_any_element(),
-                    _ => row.into_any_element(),
-                }
+                let extensions = if is_settings {
+                    extensions_row.take()
+                } else {
+                    None
+                };
+                let backup_restore = self
+                    .restore
+                    .as_ref()
+                    .filter(|restore| {
+                        restore.source == RestoreSource::Backup
+                            && group_statuses
+                                .iter()
+                                .any(|status| status.file.repo_path == restore.repo_path)
+                    })
+                    .map(|restore| self.render_restore(restore, cx));
+                v_flex()
+                    .w_full()
+                    .child(row)
+                    .children(extensions)
+                    .children(backup_restore)
+                    .into_any_element()
             });
 
         section("Files", v_flex().children(rows).into_any_element()).into_any_element()
@@ -1448,9 +1391,7 @@ impl SettingsSyncPage {
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
-        let content: AnyElement = if let Some(restore) = &self.restore {
-            self.render_restore(restore, cx)
-        } else if self.history_loading && self.history.is_none() {
+        let content: AnyElement = if self.history_loading && self.history.is_none() {
             Label::new("Loading history…")
                 .size(LabelSize::Small)
                 .color(Color::Muted)
@@ -1558,45 +1499,59 @@ impl SettingsSyncPage {
                     let repo_path = file.path.clone();
                     let hash = entry.hash.clone();
                     let deleted = file.status == 'D';
-                    ListItem::new(("history-file", index * 1000 + file_index))
-                        .indent_level(1)
-                        .child(Label::new(file.path.clone()).size(LabelSize::Small).color(
-                            if deleted {
-                                Color::Muted
-                            } else {
-                                Color::Default
-                            },
-                        ))
-                        .when(!deleted, |this| {
-                            this.end_slot(
-                                Button::new(
-                                    ("history-restore", index * 1000 + file_index),
-                                    "Restore",
-                                )
-                                .style(ButtonStyle::Subtle)
-                                .tab_index(0_isize)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.start_restore(
-                                            repo_path.clone(),
-                                            RestoreSource::Commit(hash.clone()),
-                                            cx,
-                                        );
+                    let source = RestoreSource::Commit(hash.clone());
+                    let pending_restore = self.restore.as_ref().filter(|restore| {
+                        restore.repo_path == file.path && restore.source == source
+                    });
+                    v_flex()
+                        .w_full()
+                        .child(
+                            ListItem::new(("history-file", index * 1000 + file_index))
+                                .indent_level(1)
+                                .child(Label::new(file.path.clone()).size(LabelSize::Small).color(
+                                    if deleted {
+                                        Color::Muted
+                                    } else {
+                                        Color::Default
                                     },
-                                )),
-                            )
-                        })
+                                ))
+                                .when(!deleted && pending_restore.is_none(), |this| {
+                                    this.end_slot(
+                                        Button::new(
+                                            ("history-restore", index * 1000 + file_index),
+                                            "Restore",
+                                        )
+                                        .style(ButtonStyle::Subtle)
+                                        .tab_index(0_isize)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.start_restore(
+                                                    repo_path.clone(),
+                                                    RestoreSource::Commit(hash.clone()),
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        )
+                        .children(pending_restore.map(|restore| self.render_restore(restore, cx)))
                 }))
             })
             .into_any_element()
     }
 
+    /// The restore preview, shown under the file it belongs to: a diff of the
+    /// local file against the chosen version, a note, and the two actions.
     fn render_restore(&self, restore: &RestoreState, cx: &mut Context<Self>) -> AnyElement {
         let source_label = match &restore.source {
             RestoreSource::Commit(hash) => format!("version {}", &hash[..hash.len().min(7)]),
             RestoreSource::Backup => "the local backup".to_string(),
         };
-        let title = format!("Restore {} from {source_label}", restore.repo_path);
+        let matches = restore
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.current.as_deref() == Some(preview.restored.as_str()));
 
         let body: AnyElement = if let Some(error) = &restore.error {
             Label::new(error.clone())
@@ -1604,27 +1559,19 @@ impl SettingsSyncPage {
                 .color(Color::Error)
                 .into_any_element()
         } else if let Some(preview) = &restore.preview {
-            if preview.current.as_deref() == Some(preview.restored.as_str()) {
+            if matches {
                 Label::new("The local file already matches that version.")
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .into_any_element()
             } else {
-                v_flex()
-                    .gap_2()
-                    .child(
-                        Label::new(format!("Replaces {}", preview.local_path.display()))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(render_diff(
-                        preview.current.as_deref().unwrap_or_default(),
-                        &preview.restored,
-                        "now",
-                        "restore",
-                        cx,
-                    ))
-                    .into_any_element()
+                render_diff(
+                    preview.current.as_deref().unwrap_or_default(),
+                    &preview.restored,
+                    "now",
+                    "restore",
+                    cx,
+                )
             }
         } else {
             Label::new("Loading…")
@@ -1634,28 +1581,36 @@ impl SettingsSyncPage {
         };
 
         let can_apply =
-            restore.preview.as_ref().is_some_and(|preview| {
-                preview.current.as_deref() != Some(preview.restored.as_str())
-            }) && restore.error.is_none()
-                && !restore.applying;
+            restore.preview.is_some() && !matches && restore.error.is_none() && !restore.applying;
 
         v_flex()
+            .w_full()
+            .min_w_0()
             .gap_2()
-            .child(Label::new(title))
+            .pl_8()
+            .pr_2()
+            .py_2()
+            .child(
+                Label::new(format!("Restore {} from {source_label}", restore.repo_path))
+                    .size(LabelSize::Small),
+            )
             .child(body)
+            .when(can_apply, |this| {
+                this.child(
+                    Label::new(
+                        "The current file is backed up first. The next sync sends the restored version to your other machines.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
             .child(
                 h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("restore-confirm", if restore.applying { "Restoring…" } else { "Replace local file" })
-                            .style(ButtonStyle::Filled)
-                            .tab_index(0_isize)
-                            .disabled(!can_apply)
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm_restore(cx))),
-                    )
+                    .justify_end()
+                    .gap_2()
                     .child(
                         Button::new("restore-cancel", "Cancel")
-                            .style(ButtonStyle::Outlined)
+                            .style(ButtonStyle::Subtle)
                             .tab_index(0_isize)
                             .disabled(restore.applying)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1663,11 +1618,18 @@ impl SettingsSyncPage {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        Label::new("The current file is backed up first. The next sync sends the restored version to your other machines.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                    .when(!matches, |this| {
+                        this.child(
+                            Button::new(
+                                "restore-confirm",
+                                if restore.applying { "Restoring…" } else { "Restore" },
+                            )
+                            .style(ButtonStyle::Filled)
+                            .tab_index(0_isize)
+                            .disabled(!can_apply)
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_restore(cx))),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -1825,12 +1787,39 @@ fn section(title: &'static str, content: AnyElement) -> impl IntoElement {
         .child(content)
 }
 
+/// A two-way segmented control for picking a side of a conflict.
+fn side_toggle(
+    id: impl Into<SharedString>,
+    local_label: &'static str,
+    remote_label: &'static str,
+    selected: Side,
+    on_local: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_remote: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let mut tab_index = 0_isize;
+    ToggleButtonGroup::single_row(
+        id,
+        [
+            ToggleButtonSimple::new(local_label, on_local),
+            ToggleButtonSimple::new(remote_label, on_remote),
+        ],
+    )
+    .style(ToggleButtonGroupStyle::Outlined)
+    .selected_index(match selected {
+        Side::Local => 0,
+        Side::Remote => 1,
+    })
+    .tab_index(&mut tab_index)
+    .into_any_element()
+}
+
 /// A sub-item under a setting row, drawn the way the settings window draws
 /// the fields that hang off a parent setting such as Icon Theme.
 fn setting_sub_row(
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     control: AnyElement,
+    is_last: bool,
     cx: &App,
 ) -> impl IntoElement {
     let title = title.into();
@@ -1843,7 +1832,7 @@ fn setting_sub_row(
         .gap_4()
         .p_4()
         .border_t_1()
-        .border_b_1()
+        .when(is_last, |this| this.border_b_1())
         .border_dashed()
         .border_color(cx.theme().colors().border_variant)
         .bg(cx.theme().colors().element_background.opacity(0.2))
@@ -1927,8 +1916,8 @@ fn format_date(rfc3339: &str) -> String {
         .unwrap_or_else(|_| rfc3339.to_string())
 }
 
-/// Changed lines only, as a compact preview; the full file is one click away in
-/// the diff editor.
+/// Changed lines only, in a bordered box that scrolls both ways so long lines
+/// never push the page wider.
 fn render_diff(
     local: &str,
     remote: &str,
@@ -1951,12 +1940,20 @@ fn render_diff(
     let width = local_label.len().max(remote_label.len());
 
     v_flex()
+        .id("restore-diff")
+        // Scroll events stop here instead of also scrolling the page.
+        .occlude()
+        .w_full()
+        .min_w_0()
+        .max_h(rems(16.))
+        .overflow_y_scroll()
+        .overflow_x_scroll()
         .font_buffer(cx)
         .text_xs()
         .rounded_sm()
         .border_1()
         .border_color(cx.theme().colors().border)
-        .overflow_hidden()
+        .bg(cx.theme().colors().editor_background)
         .children(changed.into_iter().take(DIFF_PREVIEW_LINES).map(|line| {
             let (label, background) = match line.kind {
                 DiffLineKind::Local => (local_label, status.deleted_background),
@@ -1964,13 +1961,15 @@ fn render_diff(
                 DiffLineKind::Same => ("", status.modified_background),
             };
             div()
+                .flex_none()
                 .px_2()
+                .whitespace_nowrap()
                 .bg(background)
                 .child(format!("{label:width$} │ {}", line.text))
         }))
         .when(total > DIFF_PREVIEW_LINES, |this| {
             this.child(
-                div().px_2().child(
+                div().flex_none().px_2().child(
                     Label::new(format!(
                         "… {} more changed lines",
                         total - DIFF_PREVIEW_LINES
